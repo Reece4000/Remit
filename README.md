@@ -3,10 +3,6 @@
 A framework for building business systems that people and AI agents operate through the
 same commands.
 
-A *remit* is the scope of authority someone is given, and to *remit* is to send payment.
-The framework does both: it gives every person and agent a remit and holds them to it,
-and it keeps the money straight.
-
 > **Status: early.** The kernel and the ledger work and are heavily tested. There is no
 > HTTP API yet, and no business modules beyond the ledger. See [Roadmap](#roadmap).
 
