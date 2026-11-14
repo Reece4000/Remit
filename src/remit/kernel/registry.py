@@ -10,17 +10,19 @@ from typing import Any
 from .document import Document
 from .errors import RegistrationError
 from .message import Command, Event
-from .module import CommandSpec, Module, Subscription
+from .module import CommandSpec, Module, Subscription, installation_order
 
 
 class Registry:
     def __init__(self, modules: Iterable[Module]) -> None:
+        """Register the modules and everything they require, dependencies first."""
         self.modules: dict[str, Module] = {}
         self._documents: dict[type[Document], str] = {}
         self._events: dict[type[Event], str] = {}
+        self._event_owners: dict[type[Event], Module] = {}
         self._commands: dict[type[Command[Any]], CommandSpec] = {}
 
-        for module in modules:
+        for module in installation_order(modules):
             if module.name in self.modules:
                 raise RegistrationError(f"module {module.name!r} is installed twice")
             self.modules[module.name] = module
@@ -29,6 +31,7 @@ class Registry:
                 self._documents[document] = name
             for name, event in module.events.items():
                 self._events[event] = name
+                self._event_owners[event] = module
             for spec in module.commands.values():
                 self._commands[spec.command] = spec
 
@@ -38,7 +41,7 @@ class Registry:
             for subscription in module.subscriptions
         )
         for subscription in self.subscriptions:
-            self.event_name(subscription.event)
+            self._check_reach(subscription)
 
     def document_name(self, kind: type[Document]) -> str:
         return _resolve(self._documents, kind, "document")
@@ -55,12 +58,23 @@ class Registry:
     def event_type(self, name: str) -> type[Event]:
         return _resolve({name: kind for kind, name in self._events.items()}, name, "event")
 
+    def _check_reach(self, subscription: Subscription) -> None:
+        event = self.event_name(subscription.event)
+        owner = self._event_owners[subscription.event]
+        module = self.modules[subscription.module]
+        if owner is not module and owner not in module.requires:
+            raise RegistrationError(
+                f"{subscription.name} reacts to {event}, "
+                f"but {module.name} does not require {owner.name}"
+            )
+
     def describe(self) -> dict[str, Any]:
         """Everything installed, as plain JSON-ready data."""
         return {name: self._describe(module) for name, module in self.modules.items()}
 
     def _describe(self, module: Module) -> dict[str, Any]:
         return {
+            "requires": [dependency.name for dependency in module.requires],
             "settings": module.settings.model_json_schema() if module.settings else None,
             "documents": {
                 name: {
@@ -107,6 +121,8 @@ def _check_lifecycle(name: str, document: type[Document]) -> None:
     lifecycle = getattr(document, "lifecycle", None)
     if lifecycle is None:
         raise RegistrationError(f"{name} declares no lifecycle")
+    if unknown := [field for field in document.unique if field not in document.model_fields]:
+        raise RegistrationError(f"{name} declares unknown fields {unknown} unique")
     for transition in lifecycle.transitions:
         unknown = [field for field in transition.requires if field not in document.model_fields]
         if unknown:

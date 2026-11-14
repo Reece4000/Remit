@@ -12,6 +12,7 @@ from .errors import (
     RemitError,
     Unauthorised,
 )
+from .fields import Code, Country, Name
 from .kernel import DeliveryFailure, Dispatched, Kernel
 from .message import Command, Event, Outcome, Recorded
 from .module import Migration, Module
@@ -24,9 +25,11 @@ __all__ = [
     "Actor",
     "ActorKind",
     "AuditEntry",
+    "Code",
     "Command",
     "ConcurrencyError",
     "Context",
+    "Country",
     "Currency",
     "CurrencyMismatch",
     "DeliveryFailure",
@@ -39,6 +42,7 @@ __all__ = [
     "Migration",
     "Module",
     "Money",
+    "Name",
     "NotFound",
     "Outcome",
     "PostgresStore",

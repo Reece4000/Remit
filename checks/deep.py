@@ -22,15 +22,26 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
-from remit.kernel import Document, Money, postgres
+from remit.kernel import Document, Money, module, postgres, registry
+from remit.kernel.context import Context
 from remit.ledger import books, commands
 
 KERNEL = ["tests/test_kernel.py"]
+MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
 RACES = ["tests/test_postgres.py"]
 RACE_RUNS = 20
 
 real_movements = books.movements
+real_order = module.installation_order
+
+
+def ignoring_version(self: Context, kind: type[Document], id: object, **_: object) -> Document:
+    return Context._get(self, kind, id)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+
+
+def dependents_first(modules: Any) -> tuple[Any, ...]:
+    return tuple(reversed(real_order(modules)))
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,31 @@ MUTATIONS = [
         "final documents can be changed",
         KERNEL,
         swap(Document, "is_final", property(lambda _: False)),
+    ),
+    Mutation(
+        "changes from out-of-date copies overwrite newer ones",
+        KERNEL,
+        swap(Context, "get", ignoring_version),
+    ),
+    Mutation(
+        "unique values can be used twice",
+        [*KERNEL, *LEDGER],
+        swap(Context, "_require_unique", nothing),
+    ),
+    Mutation(
+        "modules are registered before their dependencies",
+        MODULES,
+        swap(registry, "installation_order", dependents_first),
+    ),
+    Mutation(
+        "modules are installed before their dependencies",
+        MODULES,
+        swap(postgres, "installation_order", dependents_first),
+    ),
+    Mutation(
+        "modules react to events of modules they do not require",
+        MODULES,
+        swap(registry.Registry, "_check_reach", nothing),
     ),
     Mutation(
         "postings are not validated",
@@ -130,7 +166,7 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *LEDGER, *RACES]):
+    if not passes([*KERNEL, *MODULES, *LEDGER, *RACES]):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")

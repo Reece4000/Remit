@@ -60,7 +60,22 @@ class Context:
     def emitted(self) -> tuple[Event, ...]:
         return tuple(self._emitted)
 
-    def get[D: Document](self, kind: type[D], id: UUID) -> D:
+    def get[D: Document](self, kind: type[D], id: UUID, *, version: int | None = None) -> D:
+        """A document by id. With `version`, refuse if it has changed since that version.
+
+        Pass the version a command was written against, so that a change made by someone
+        working from an out-of-date copy is refused rather than overwriting another's.
+        """
+        document = self._get(kind, id)
+        if version is not None and document.version != version:
+            name = self._registry.document_name(kind)
+            raise Rejected(
+                f"{name} {id} has changed since version {version} (it is now at version "
+                f"{document.version}); read it again and decide whether your change still holds"
+            )
+        return document
+
+    def _get[D: Document](self, kind: type[D], id: UUID) -> D:
         if written := self._written.get((kind, id)):
             return cast(D, written)
         name = self._registry.document_name(kind)
@@ -130,7 +145,19 @@ class Context:
                 "work; use the copy that change returned"
             )
 
+    def _require_unique(self, document: Document) -> None:
+        for field in document.unique:
+            value = getattr(document, field)
+            if value is None:
+                continue
+            if any(
+                other.id != document.id for other in self.find(type(document), **{field: value})
+            ):
+                name = self._registry.document_name(type(document))
+                raise Rejected(f"{name} {field} {value!r} is already in use")
+
     def _write[D: Document](self, document: D) -> D:
+        self._require_unique(document)
         key = (type(document), document.id)
         read_version = self._read_versions.setdefault(key, document.version)
         written = document.model_copy(update={"version": read_version + 1})

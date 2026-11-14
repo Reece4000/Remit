@@ -13,7 +13,9 @@ from .document import Document
 
 
 class Command[R](BaseModel):
-    model_config = ConfigDict(frozen=True)
+    # Unknown fields are refused, not ignored: a caller who names a field that does not
+    # exist (or cannot be changed) must be told, not left believing it took effect.
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class Event(BaseModel):

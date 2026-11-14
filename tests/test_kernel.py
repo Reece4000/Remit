@@ -1,8 +1,9 @@
 """Kernel behaviour, exercised through a toy module that has nothing to do with accounting."""
 
-from uuid import UUID
+from uuid import UUID, uuid7
 
 import pytest
+from pydantic import ValidationError
 
 from remit.kernel import (
     Actor,
@@ -65,12 +66,18 @@ class OpenTicket(Command[Ticket]):
 class RenameTicket(Command[Ticket]):
     ticket_id: UUID
     subject: str
+    version: int | None = None
 
 
 class MoveTicket(Command[Ticket]):
     ticket_id: UUID
     transition: str
     resolution: str | None = None
+
+
+class RenameAndCount(Command[tuple[int, int]]):
+    ticket_id: UUID
+    subject: str
 
 
 class OpenThenFail(Command[None]):
@@ -90,7 +97,8 @@ def open_ticket(command: OpenTicket, context: Context) -> Ticket:
 @desk.command
 def rename_ticket(command: RenameTicket, context: Context) -> Ticket:
     """Change a ticket's subject."""
-    return context.update(context.get(Ticket, command.ticket_id), subject=command.subject)
+    ticket = context.get(Ticket, command.ticket_id, version=command.version)
+    return context.update(ticket, subject=command.subject)
 
 
 @desk.command
@@ -102,6 +110,17 @@ def move_ticket(command: MoveTicket, context: Context) -> Ticket:
     if command.transition == "resolve":
         context.emit(TicketResolved(ticket_id=ticket.id))
     return moved
+
+
+@desk.command
+def rename_and_count(command: RenameAndCount, context: Context) -> tuple[int, int]:
+    """Rename a ticket, then count tickets under its old and new subjects."""
+    ticket = context.get(Ticket, command.ticket_id)
+    context.update(ticket, subject=command.subject)
+    context.create(Ticket(subject=command.subject))
+    old = context.find(Ticket, subject=ticket.subject)
+    new = context.find(Ticket, subject=command.subject)
+    return len(old), len(new)
 
 
 @desk.command
@@ -158,6 +177,29 @@ def test_an_actor_without_the_permission_is_refused(kernel: Kernel, ticket: Tick
     with pytest.raises(Unauthorised):
         kernel.execute(RenameTicket(ticket_id=ticket.id, subject="Mine now"), actor=VISITOR)
     assert kernel.get(Ticket, ticket.id) == ticket
+
+
+def test_find_sees_what_the_command_has_already_written(kernel: Kernel, ticket: Ticket) -> None:
+    command = RenameAndCount(ticket_id=ticket.id, subject="Scanner")
+    assert kernel.execute(command, actor=AGENT).result == (0, 2)
+
+
+def test_a_command_refuses_fields_it_does_not_have() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RenameTicket.model_validate({"ticket_id": uuid7(), "subject": "Fax", "priority": "high"})
+
+
+def test_a_change_made_from_an_out_of_date_copy_is_refused(kernel: Kernel, ticket: Ticket) -> None:
+    renamed = kernel.execute(
+        RenameTicket(ticket_id=ticket.id, subject="Scanner", version=ticket.version), actor=AGENT
+    ).result
+    assert renamed.version == ticket.version + 1
+
+    with pytest.raises(Rejected, match=r"has changed since version 1 \(it is now at version 2\)"):
+        kernel.execute(
+            RenameTicket(ticket_id=ticket.id, subject="Fax", version=ticket.version), actor=AGENT
+        )
+    assert kernel.get(Ticket, ticket.id) == renamed
 
 
 def test_a_transition_waits_for_its_required_fields(kernel: Kernel, ticket: Ticket) -> None:
@@ -288,3 +330,93 @@ def test_a_transition_cannot_require_a_field_that_does_not_exist() -> None:
 
     with pytest.raises(RegistrationError, match="unknown fields"):
         Kernel([broken])
+
+
+def test_a_unique_field_cannot_be_declared_on_a_field_that_does_not_exist() -> None:
+    broken = Module("broken")
+
+    @broken.document
+    class Parcel(Document):
+        """A parcel."""
+
+        lifecycle = Lifecycle(initial="packed")
+        unique = ("waybill",)
+
+    with pytest.raises(RegistrationError, match=r"unknown fields \['waybill'\] unique"):
+        Kernel([broken])
+
+
+# Unique fields, through a module whose queues are known by a code.
+
+routing = Module("routing")
+
+
+@routing.document
+class Queue(Document):
+    """Where tickets of one kind wait."""
+
+    lifecycle = Lifecycle(initial="open", transitions=(Transition("close", "open", "closed"),))
+    unique = ("code", "email")
+
+    code: str
+    email: str | None = None
+
+
+class CreateQueue(Command[Queue]):
+    code: str
+    email: str | None = None
+
+
+class ChangeQueue(Command[Queue]):
+    queue_id: UUID
+    code: str
+    email: str | None = None
+
+
+@routing.command
+def create_queue(command: CreateQueue, context: Context) -> Queue:
+    """Create a queue."""
+    return context.create(Queue(code=command.code, email=command.email))
+
+
+@routing.command
+def change_queue(command: ChangeQueue, context: Context) -> Queue:
+    """Change a queue's code and email."""
+    queue = context.get(Queue, command.queue_id)
+    return context.update(queue, code=command.code, email=command.email)
+
+
+@pytest.fixture
+def routes(store: Store) -> Kernel:
+    return Kernel([routing], store=store)
+
+
+ROUTER = Actor(id="router", kind=ActorKind.HUMAN, permissions=frozenset({"routing.*"}))
+
+
+def test_a_unique_value_cannot_be_used_twice(routes: Kernel) -> None:
+    routes.execute(CreateQueue(code="IT", email="it@example.com"), actor=ROUTER)
+
+    with pytest.raises(Rejected, match=r"routing\.queue code 'IT' is already in use"):
+        routes.execute(CreateQueue(code="IT"), actor=ROUTER)
+    with pytest.raises(Rejected, match=r"routing\.queue email 'it@example\.com' is already in use"):
+        routes.execute(CreateQueue(code="HR", email="it@example.com"), actor=ROUTER)
+    assert len(routes.find(Queue)) == 1
+
+
+def test_a_document_may_keep_its_own_unique_value_but_not_take_another(routes: Kernel) -> None:
+    it = routes.execute(CreateQueue(code="IT"), actor=ROUTER).result
+    routes.execute(CreateQueue(code="HR"), actor=ROUTER)
+
+    kept = routes.execute(
+        ChangeQueue(queue_id=it.id, code="IT", email="it@example.com"), actor=ROUTER
+    )
+    assert kept.result.email == "it@example.com"
+    with pytest.raises(Rejected, match="code 'HR' is already in use"):
+        routes.execute(ChangeQueue(queue_id=it.id, code="HR"), actor=ROUTER)
+
+
+def test_unset_unique_values_do_not_collide(routes: Kernel) -> None:
+    routes.execute(CreateQueue(code="IT"), actor=ROUTER)
+    routes.execute(CreateQueue(code="HR"), actor=ROUTER)
+    assert len(routes.find(Queue, email=None)) == 2

@@ -16,6 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 from remit.kernel import (
+    Code,
     Currency,
     Document,
     Event,
@@ -23,6 +24,7 @@ from remit.kernel import (
     Migration,
     Module,
     Money,
+    Name,
     Transition,
 )
 
@@ -68,9 +70,10 @@ class Account(Document):
         initial="active",
         transitions=(Transition("archive", source="active", target="archived"),),
     )
+    unique = ("code",)
 
-    code: str
-    name: str
+    code: Code
+    name: Name
     type: AccountType
     currency: Currency | None = None
     """When set, the account only accepts postings in this currency."""

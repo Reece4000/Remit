@@ -7,7 +7,7 @@ derived from these declarations, so each one must carry a docstring.
 
 import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -54,11 +54,13 @@ class Module:
         self,
         name: str,
         *,
+        requires: tuple[Module, ...] = (),
         settings: type[BaseModel] | None = None,
         migrations: tuple[Migration, ...] = (),
         sql: str = "",
     ) -> None:
         self.name = name
+        self._requires = requires
         self.settings = settings
         self.migrations = migrations
         """Schema changes, each applied once, in order, when a PostgreSQL store is installed."""
@@ -68,6 +70,15 @@ class Module:
         self.events: dict[str, type[Event]] = {}
         self.commands: dict[str, CommandSpec] = {}
         self.subscriptions: list[Subscription] = []
+
+    @property
+    def requires(self) -> tuple[Module, ...]:
+        """The modules this one builds on: it may use their public API and react to their events.
+
+        A dependency is a module object, so it must exist before the module that names
+        it, and requirements cannot change afterwards. A cycle therefore cannot be declared.
+        """
+        return self._requires
 
     def document[D: Document](self, kind: type[D]) -> type[D]:
         """Declare a document type."""
@@ -105,6 +116,24 @@ class Module:
         if name in taken:
             raise RegistrationError(f"{name} is declared twice")
         return name
+
+
+def installation_order(modules: Iterable[Module]) -> tuple[Module, ...]:
+    """The given modules and everything they require, each after all of its dependencies.
+
+    Otherwise modules keep the order they were given in, so installation is deterministic.
+    """
+    ordered: dict[int, Module] = {}
+
+    def visit(module: Module) -> None:
+        if id(module) not in ordered:
+            for dependency in module.requires:
+                visit(dependency)
+            ordered[id(module)] = module
+
+    for module in modules:
+        visit(module)
+    return tuple(ordered.values())
 
 
 def _signature(handler: Callable[..., Any]) -> tuple[type[Command[Any]], TypeAdapter[Any]]:

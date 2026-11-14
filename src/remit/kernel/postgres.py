@@ -11,13 +11,13 @@ from importlib.resources import files
 from typing import Any, cast
 from uuid import UUID
 
-from psycopg import Connection, IsolationLevel, errors
+from psycopg import Connection, IsolationLevel, errors, sql
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .actor import Actor
-from .errors import ConcurrencyError
-from .module import Module
+from .errors import ConcurrencyError, RegistrationError
+from .module import Module, installation_order
 from .store import AuditEntry, Commit, Json, StoredEvent, Unit
 
 _SCHEMA = files(__package__).joinpath("schema.sql").read_bytes()
@@ -25,6 +25,8 @@ _SCHEMA = files(__package__).joinpath("schema.sql").read_bytes()
 # Held from the moment a unit records events until it commits, so that events become
 # visible in the same order as their positions and no subscriber can skip one.
 _EVENT_ORDER_LOCK = 7_154_697_431
+
+_MAX_IDENTIFIER = 63  # PostgreSQL's NAMEDATALEN - 1, in bytes
 
 _UNSERIALISABLE = (errors.SerializationFailure, errors.DeadlockDetected, errors.UniqueViolation)
 
@@ -39,10 +41,16 @@ class PostgresStore:
         self._pool.open(wait=True, timeout=timeout)
 
     def install(self, modules: Iterable[Module] = ()) -> None:
-        """Create the kernel's tables, then each module's migrations and database rules."""
+        """Create the kernel's tables, then each module's migrations and database rules.
+
+        Modules are installed with everything they require, dependencies first.
+        """
         with self._pool.connection() as connection:
             connection.execute(_SCHEMA)
-            for module in modules:
+            for module in installation_order(modules):
+                for kind, document in module.documents.items():
+                    for field in document.unique:
+                        connection.execute(_unique_index(kind, field))
                 for migration in module.migrations:
                     claimed = connection.execute(
                         "INSERT INTO migrations (module, name) VALUES (%s, %s) "
@@ -66,6 +74,16 @@ class PostgresStore:
             raise ConcurrencyError("the database could not serialise this unit of work") from (
                 conflict
             )
+
+
+def _unique_index(kind: str, field: str) -> sql.Composed:
+    name = f"unique {kind}.{field}"
+    if len(name.encode()) > _MAX_IDENTIFIER:
+        raise RegistrationError(f"{kind}.{field} is too long a name to index; shorten it")
+    return sql.SQL(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON documents ((body ->> {field})) "
+        "WHERE kind = {kind}"
+    ).format(name=sql.Identifier(name), field=sql.Literal(field), kind=sql.Literal(kind))
 
 
 def _serialisable(connection: Connection[Any]) -> None:

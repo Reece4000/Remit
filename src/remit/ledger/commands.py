@@ -7,7 +7,7 @@ pgledger move the money, all in one unit of work.
 from datetime import date, timedelta
 from uuid import UUID
 
-from remit.kernel import Command, Context, Currency, Money, Rejected
+from remit.kernel import Code, Command, Context, Currency, Money, Name, Rejected
 
 from .books import record
 from .model import (
@@ -27,8 +27,8 @@ from .queries import balance, closed_through
 
 
 class OpenAccount(Command[Account]):
-    code: str
-    name: str
+    code: Code
+    name: Name
     type: AccountType
     currency: Currency | None = None
 
@@ -56,8 +56,6 @@ class ClosePeriod(Command[PeriodClose]):
 @module.command
 def open_account(command: OpenAccount, context: Context) -> Account:
     """Add an account to the chart of accounts. Codes are unique and never reused."""
-    if context.find(Account, code=command.code):
-        raise Rejected(f"account code {command.code!r} is already in use")
     account = context.create(
         Account(code=command.code, name=command.name, type=command.type, currency=command.currency)
     )

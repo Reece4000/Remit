@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS ledger_books (
     PRIMARY KEY (account, currency)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ledger_account_code
-    ON documents ((body ->> 'code')) WHERE kind = 'ledger.account';
+-- Account codes are unique through `Account.unique`, which the kernel indexes.
+DROP INDEX IF EXISTS ledger_account_code;
 
 -- pgledger only ever inserts into these two tables, so nothing legitimate is blocked.
 CREATE OR REPLACE TRIGGER pgledger_transfers_append_only
