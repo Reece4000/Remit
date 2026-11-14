@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Everything that must pass before code is shared. Run it from anywhere:
+#
+#   ./check          format, lint, types, and the full test suite on PostgreSQL
+#   ./check --deep   the above, then prove the tests have teeth (about a minute)
+#
+# There is no hosted CI; this is the gate. To run it automatically before every push:
+#
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+if [[ ! -x .venv/bin/pytest ]]; then
+    echo "No virtualenv yet. Create one with:" >&2
+    echo "  python3.14 -m venv .venv && .venv/bin/pip install -e . --group dev" >&2
+    exit 1
+fi
+
+# Without this, tests that need PostgreSQL are skipped when it is not running.
+# A gate that passes by skipping the ledger is not a gate.
+export REMIT_REQUIRE_POSTGRES=1
+
+step() { printf '\n== %s\n' "$1"; }
+
+step "format"
+.venv/bin/ruff format --check .
+
+step "lint"
+.venv/bin/ruff check .
+
+step "types"
+.venv/bin/pyright
+
+step "tests"
+.venv/bin/pytest -q
+
+if [[ "${1:-}" == "--deep" ]]; then
+    step "deep: mutations and repeated races"
+    .venv/bin/python checks/deep.py
+fi
+
+printf '\nAll checks passed.\n'

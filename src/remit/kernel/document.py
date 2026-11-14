@@ -1,0 +1,75 @@
+"""Documents: the records a business keeps, each with a declared lifecycle.
+
+A document is immutable in memory; handlers change one by asking the context for a
+revised copy. A document in a final state (one with no way out) can never change again,
+which is what makes a posted journal entry or an issued invoice trustworthy.
+"""
+
+from dataclasses import dataclass
+from typing import Any, ClassVar, cast
+from uuid import UUID, uuid7
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .errors import Rejected
+
+
+@dataclass(frozen=True)
+class Transition:
+    name: str
+    source: str
+    target: str
+    requires: tuple[str, ...] = ()
+    """Fields that must be filled in before this transition is allowed."""
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    initial: str
+    transitions: tuple[Transition, ...] = ()
+
+    @property
+    def states(self) -> tuple[str, ...]:
+        named = (state for t in self.transitions for state in (t.source, t.target))
+        return tuple(dict.fromkeys((self.initial, *named)))
+
+    @property
+    def final(self) -> frozenset[str]:
+        return frozenset(self.states) - {t.source for t in self.transitions}
+
+    def find(self, name: str, state: str) -> Transition:
+        for transition in self.transitions:
+            if transition.name == name and transition.source == state:
+                return transition
+        allowed = sorted({t.name for t in self.transitions if t.source == state})
+        hint = f"allowed here: {', '.join(allowed)}" if allowed else "this state is final"
+        raise Rejected(f"cannot {name} from state {state!r}; {hint}")
+
+
+class Document(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    lifecycle: ClassVar[Lifecycle]
+
+    id: UUID = Field(default_factory=uuid7)
+    state: str = ""
+    version: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _start_in_initial_state(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        fields = cast(dict[str, Any], data)
+        return fields if fields.get("state") else {**fields, "state": cls.lifecycle.initial}
+
+    @field_validator("state")
+    @classmethod
+    def _state_is_declared(cls, state: str) -> str:
+        if state not in cls.lifecycle.states:
+            raise ValueError(f"{state!r} is not a state of {cls.__name__}")
+        return state
+
+    @property
+    def is_final(self) -> bool:
+        return self.state in self.lifecycle.final
