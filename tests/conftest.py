@@ -11,7 +11,7 @@ from collections.abc import Iterator
 import psycopg
 import pytest
 
-from remit import ledger
+from remit import items, ledger, parties
 from remit.kernel import MemoryStore, PostgresStore, Store
 
 DSN = os.environ.get("REMIT_TEST_DSN", "postgresql:///remit_test")
@@ -34,7 +34,7 @@ def installed_postgres() -> Iterator[PostgresStore]:
         if os.environ.get("REMIT_REQUIRE_POSTGRES"):
             pytest.fail(f"PostgreSQL is required but nothing answers at {DSN}: {error}")
         pytest.skip(f"no PostgreSQL at {DSN}: {error}")
-    store.install([ledger.module])
+    store.install([ledger.module, parties.module, items.module])
     yield store
     store.close()
 

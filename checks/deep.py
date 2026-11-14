@@ -29,6 +29,7 @@ from remit.ledger import books, commands
 KERNEL = ["tests/test_kernel.py"]
 MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
+STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
 RACES = ["tests/test_postgres.py"]
 RACE_RUNS = 20
 
@@ -71,12 +72,12 @@ MUTATIONS = [
     ),
     Mutation(
         "changes from out-of-date copies overwrite newer ones",
-        KERNEL,
+        [*KERNEL, *STANDARD],
         swap(Context, "get", ignoring_version),
     ),
     Mutation(
         "unique values can be used twice",
-        [*KERNEL, *LEDGER],
+        [*KERNEL, *LEDGER, *STANDARD],
         swap(Context, "_require_unique", nothing),
     ),
     Mutation(
@@ -166,7 +167,7 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *MODULES, *LEDGER, *RACES]):
+    if not passes([*KERNEL, *MODULES, *LEDGER, *STANDARD, *RACES]):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")

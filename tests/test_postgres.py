@@ -12,11 +12,12 @@ import pytest
 from conftest import DSN
 from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, desk
 
-from remit import ledger
+from remit import items, ledger, parties
 from remit.kernel import Actor, ActorKind, Kernel, Money, PostgresStore, Rejected
 from remit.ledger import AccountType, credit, debit
 
 BOOKKEEPER = Actor(id="bookkeeper", kind=ActorKind.HUMAN, permissions=frozenset({"ledger.*"}))
+CLERK = Actor(id="clerk", kind=ActorKind.HUMAN, permissions=frozenset({"parties.*", "items.*"}))
 JAN_31 = date(2026, 1, 31)
 
 
@@ -27,7 +28,7 @@ def gbp(amount: str) -> Money:
 @pytest.fixture
 def kernel(postgres: PostgresStore) -> Kernel:
     return Kernel(
-        [ledger.module, desk],
+        [ledger.module, desk, parties.module, items.module],
         settings=[ledger.LedgerSettings(base_currency="GBP")],
         store=postgres,
     )
@@ -127,6 +128,18 @@ def test_the_database_itself_refuses_to_alter_history(kernel: Kernel, accounts) 
             connection.execute(statement.encode())
 
 
+def test_the_database_itself_refuses_a_duplicate_code(kernel: Kernel) -> None:
+    command = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+    kernel.execute(command, actor=CLERK)
+    copy = {"code": "C0001", "kind": "person", "name": "Impostor", "state": "active"}
+    with pytest.raises(psycopg.errors.UniqueViolation), psycopg.connect(DSN) as connection:
+        connection.execute(
+            "INSERT INTO documents (kind, id, version, final, body) "
+            "VALUES ('parties.party', %s, 1, false, %s)",
+            (uuid4(), json.dumps({**copy, "id": str(uuid4())})),
+        )
+
+
 def test_pgledger_itself_refuses_a_transfer_into_a_closed_period(kernel: Kernel, accounts) -> None:
     post(kernel, accounts, date(2026, 3, 1))
     kernel.execute(ledger.ClosePeriod(through=date(2026, 3, 31)), actor=BOOKKEEPER)
@@ -163,6 +176,46 @@ def test_one_account_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel
     assert sum(isinstance(result, ledger.Account) for result in results) == 1
     assert sum(isinstance(result, Rejected) for result in results) == 7
     assert len(kernel.find(ledger.Account)) == 1
+
+
+def test_one_party_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
+    claim = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+
+    results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
+
+    assert sum(isinstance(result, parties.Party) for result in results) == 1
+    assert len(kernel.find(parties.Party)) == 1
+
+
+def test_one_item_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
+    claim = items.AddItem(code="PIP-200", kind=items.ItemKind.GOODS, name="Pipette")
+
+    results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
+
+    assert sum(isinstance(result, items.Item) for result in results) == 1
+    assert len(kernel.find(items.Item)) == 1
+
+
+def test_of_many_amendments_from_the_same_copy_exactly_one_lands(kernel: Kernel) -> None:
+    command = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+    amy = kernel.execute(command, actor=CLERK).result
+
+    def amend(number: int) -> parties.Party:
+        renamed = parties.AmendParty(
+            party_id=amy.id,
+            version=amy.version,
+            name=f"Amy {number}",
+            tax_number=None,
+            addresses=(),
+            contacts=(),
+        )
+        return kernel.execute(renamed, actor=CLERK).result
+
+    results = race(8, amend)
+
+    [landed] = [result for result in results if isinstance(result, parties.Party)]
+    assert all("has changed since version 1" in str(r) for r in results if r is not landed)
+    assert kernel.get(parties.Party, amy.id) == landed
 
 
 def test_an_entry_is_reversed_by_exactly_one_of_many_attempts(kernel: Kernel, accounts) -> None:
