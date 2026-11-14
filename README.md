@@ -245,6 +245,16 @@ import only `remit.kernel`.
 
 ## Licence
 
-A licence has not been chosen yet. The vendored copy of pgledger and its ULID helpers
-keep their own licences (MIT and BSD 3-Clause), which are included alongside them in
-`src/remit/ledger/vendor/pgledger`.
+Copyright (C) 2026 Reece Mitchell.
+
+Remit is free software, licensed under the
+[GNU Affero General Public License](LICENSE), version 3 or (at your option) any later
+version. You may use, change and share it, including commercially. If you distribute
+it, or software built on it, or let people use either over a network, you must make the
+complete source available to them under the same licence. It comes with no warranty.
+
+To use Remit in software you do not want to release under the AGPL, ask about a
+commercial licence.
+
+The vendored copy of pgledger and its ULID helpers keep their own licences (MIT and
+BSD 3-Clause), which are included alongside them in `src/remit/ledger/vendor/pgledger`.
