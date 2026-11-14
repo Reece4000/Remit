@@ -77,7 +77,8 @@ def record(context: Context, entry: JournalEntry) -> None:
     accounts = {book: _pgledger_account(context, book) for book in books}
     requests = ", ".join(["(%s, %s, %s)::transfer_request"] * len(moves))
     context.sql(
-        f"SELECT id FROM pgledger_create_transfers(ARRAY[{requests}], "
+        # Only placeholders are interpolated; every value is a bound parameter.
+        f"SELECT id FROM pgledger_create_transfers(ARRAY[{requests}], "  # noqa: S608
         "event_at => %s, metadata => %s::jsonb)",
         [
             *(value for m in moves for value in (accounts[m.source], accounts[m.target], m.amount)),

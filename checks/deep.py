@@ -22,10 +22,8 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
-import remit.kernel.postgres as postgres
-import remit.ledger.books as books
-import remit.ledger.commands as commands
-from remit.kernel import Document, Money
+from remit.kernel import Document, Money, postgres
+from remit.ledger import books, commands
 
 KERNEL = ["tests/test_kernel.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]

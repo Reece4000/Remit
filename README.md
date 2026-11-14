@@ -190,22 +190,24 @@ time, and confirms the tests fail for each.
 
 ## Getting started
 
-Requires Python 3.14 and PostgreSQL. It is developed and tested on PostgreSQL 18.
+Requires Python 3.14, [uv](https://docs.astral.sh/uv/) and PostgreSQL. It is developed
+and tested on PostgreSQL 18.
 
 ```sh
-python3.14 -m venv .venv
-.venv/bin/pip install -e . --group dev
 createdb remit_test        # once; or point REMIT_TEST_DSN at another database
-./check
+./check                    # creates .venv from uv.lock on first run
 ```
 
 ## Testing
 
-`./check` is the gate: format, lint, strict type checking and the full test suite, which
-must run on PostgreSQL. It takes about twenty seconds. There is no hosted CI.
+`./check` is the gate. It installs exactly the versions in `uv.lock`, then runs format,
+lint (including security rules), strict type checking, the full test suite on
+PostgreSQL, and branch coverage against a floor that only ever rises. It takes about
+twenty seconds. There is no hosted CI.
 
-`./check --deep` adds the mutation checks described above and repeats the concurrency
-tests twenty times. It takes about a minute.
+`./check --deep` adds an audit of dependencies for known vulnerabilities, the mutation
+checks described above, and twenty repeats of the concurrency tests. It takes about a
+minute.
 
 To run the gate before every push:
 

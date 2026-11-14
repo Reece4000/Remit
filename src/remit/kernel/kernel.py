@@ -181,7 +181,7 @@ class Kernel:
             except ConcurrencyError:
                 if attempt == self._attempts:
                     raise
-                time.sleep(random.uniform(0, 0.002 * 2**attempt))
+                time.sleep(random.uniform(0, 0.002 * 2**attempt))  # noqa: S311  jitter, not secrecy
         raise AssertionError("unreachable")
 
     def _context(self, unit: Unit, actor: Actor) -> Context:
