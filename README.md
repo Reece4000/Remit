@@ -3,8 +3,8 @@
 A framework for building business systems that people and AI agents operate through the
 same commands.
 
-> **Status: early.** The kernel and the ledger work and are heavily tested. There is no
-> HTTP API yet, and no business modules beyond the ledger. See [Roadmap](#roadmap).
+> **Status: early.** The kernel, the ledger and the first standard modules (parties and
+> items) work and are heavily tested. There is no HTTP API yet. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -36,6 +36,9 @@ entry in the audit trail.
 - **Everything is described by its own declarations.** Documents, lifecycles, commands
   and events are available as JSON Schema from the registry. A declaration without a
   docstring does not register.
+- **Modules build on modules.** A module declares the modules it requires, may use
+  only their public API and react only to their events, and brings them with it when
+  installed. Remit's own standard modules follow the same rules as anyone else's.
 - **The books are double-entry and multi-currency**, kept by
   [pgledger](https://github.com/pgr0ss/pgledger) in the same transaction as everything
   else.
@@ -184,9 +187,12 @@ which puts the posting in the same transaction as the document that caused it.
 | Posted entries, the event log and the audit trail cannot be altered | Database triggers, as well as the kernel | Tests that write to the tables directly and expect refusal |
 | Nothing is posted into a closed period | The ledger's commands and a database trigger | Both of the above |
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
+| A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
+| Codes and other unique values are never shared | A document's `unique` fields, checked by the kernel and indexed by the database | Threads racing for the same code, and direct inserts of a duplicate |
+| A module reaches only what it declares it requires | The registry, and an architecture test over every import | Modules that try to react to undeclared events |
 
-`./check --deep` goes one step further: it breaks the framework in nine ways, one at a
-time, and confirms the tests fail for each.
+`./check --deep` goes one step further: it breaks the framework in fourteen ways, one at
+a time, and confirms the tests fail for each.
 
 ## Getting started
 
@@ -223,24 +229,30 @@ Kernel tests run in memory and on PostgreSQL; ledger tests need PostgreSQL. Runn
 | Path | Contents |
 |---|---|
 | `src/remit/kernel` | Business-agnostic mechanics: money, actors, documents, commands, events, the registry, the unit of work, and the memory and PostgreSQL stores. |
+| `src/remit/parties`, `src/remit/items` | Standard modules: the people and organisations a business deals with, and the goods and services it handles. |
 | `src/remit/ledger` | General ledger: accounts, journal entries, reversals, period closes. Built only on the kernel's public API. `books.py` is the bridge to pgledger, `rules.sql` holds what the database enforces, `vendor/pgledger` is pgledger v0.9.0 itself, unmodified. |
 | `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands. |
 | `checks` | The mutation checks behind `./check --deep`. |
+| `docs` | Design notes. |
+| `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. |
 
-Two layering rules are enforced by a test: the kernel imports no module, and modules
-import only `remit.kernel`.
+Two layering rules are enforced by a test: the kernel imports no module, and a module
+imports only `remit.kernel` and the top-level packages of the modules it requires.
 
 ## Roadmap
 
 1. **The outside surface.** A REST API and an MCP server, both generated from the
    registry; a worker process for event dispatch; authentication; a container image.
 2. **Controls.** Roles, limits per role, approval steps and segregation of duties.
-3. **More kernel primitives.** Links between the lines of related documents, rules held
-   as data, documents rendered through versioned templates, and a query layer for
-   reporting.
-4. **Business content.** Standard modules (parties, items, pricing, sales, purchasing,
-   inventory), tax and financial statements, and templates that preconfigure them for
-   common kinds of business.
+3. **More kernel primitives.** Modules that add fields to, and refuse transitions of,
+   documents they do not own; links between the lines of related
+   documents; rules held as data; documents rendered through versioned templates; and a
+   query layer for reporting.
+4. **Business content.** Standard modules (parties, items, pricing, tax, banking, sales,
+   purchasing, inventory), built exactly as any third-party module would be, and
+   templates that give a new business a working starting point. See
+   [modules and templates](docs/modules-and-templates.md), and the five
+   [example companies](examples/) they are tested against.
 5. **Agents and workflows.** An agent runtime that fills a role within its limits and
    escalates when refused, durable workflows triggered by events, and authoring both
    from plain-language descriptions.
