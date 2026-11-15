@@ -18,7 +18,8 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from .actor import Actor
-from .errors import ConcurrencyError, RemitError
+from .errors import ConcurrencyError, Rejected, RemitError
+from .module import Module
 
 type Json = dict[str, Any]
 
@@ -52,6 +53,17 @@ class AuditEntry:
     events: tuple[str, ...]
     cause: int | None = None
     """Log position of the event that triggered this, when a subscription ran."""
+    key: UUID | None = None
+    """The data key personal values in `input` are sealed with, if it holds any."""
+
+
+@dataclass(frozen=True)
+class SubjectKey:
+    """A data key, and the data subjects whose personal values it seals."""
+
+    id: UUID
+    secret: bytes
+    subjects: tuple[UUID, ...]
 
 
 @dataclass(frozen=True)
@@ -62,7 +74,11 @@ class Commit:
     events: tuple[tuple[str, Json], ...]
     audit: AuditEntry
     cursor: tuple[str, int] | None = None
-    idempotency: tuple[str, Json] | None = None
+    idempotency: tuple[str, str, Json] | None = None
+    """The actor, their idempotency key, and the record of what the command did."""
+    keys: tuple[SubjectKey, ...] = ()
+    erasures: tuple[UUID, ...] = ()
+    """Data subjects whose keys are deleted, after `keys` are stored."""
 
 
 class Unit(Protocol):
@@ -77,9 +93,22 @@ class Unit(Protocol):
     ) -> list[StoredEvent]: ...
 
     def cursor(self, subscription: str) -> int: ...
-    def idempotency(self, key: str) -> Json | None: ...
+    def idempotency(self, actor: str, key: str) -> Json | None:
+        """The record an actor's idempotency key was used for. Keys are per actor."""
+        ...
+
+    def secret(self, key: UUID) -> bytes | None:
+        """A data key's secret, or None once the data it sealed has been erased."""
+        ...
+
     def audit(self) -> list[AuditEntry]: ...
-    def commit(self, commit: Commit) -> None: ...
+    def commit(self, commit: Commit) -> None:
+        """Apply the commit. Refused, changing nothing, if it breaks a rule the store keeps."""
+        ...
+
+    def rehearse(self, commit: Commit) -> None:
+        """Refuse the commit for every reason `commit` would, then undo everything."""
+        ...
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
         """Run a module's own SQL inside this unit's transaction."""
@@ -94,7 +123,13 @@ class Store(Protocol):
     runs_sql: bool
     """Whether units can run a module's own SQL. Modules that ship SQL need this."""
 
-    def unit(self) -> AbstractContextManager[Unit]: ...
+    def unit(self, *, read_only: bool = False) -> AbstractContextManager[Unit]:
+        """A unit of work. A read-only one refuses every change, including through SQL."""
+        ...
+
+    def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
+        """Why this store cannot yet run these modules. Empty when it can."""
+        ...
 
 
 class MemoryStore:
@@ -102,16 +137,23 @@ class MemoryStore:
 
     runs_sql = False
 
+    def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
+        """Nothing: a memory store needs no installation."""
+        return ()
+
     def __init__(self) -> None:
         self._documents: defaultdict[str, dict[UUID, StoredDocument]] = defaultdict(dict)
         self._events: list[StoredEvent] = []
         self._audit: list[AuditEntry] = []
         self._cursors: dict[str, int] = {}
-        self._idempotency: dict[str, Json] = {}
+        self._idempotency: dict[tuple[str, str], Json] = {}
+        self._secrets: dict[UUID, bytes] = {}
+        self._subjects: dict[UUID, set[UUID]] = {}
         self._lock = threading.RLock()
 
     @contextmanager
-    def unit(self) -> Generator[Unit]:
+    def unit(self, *, read_only: bool = False) -> Generator[Unit]:
+        """Changes reach this store only through `commit`, which readers never call."""
         with self._lock:
             yield self
 
@@ -135,20 +177,30 @@ class MemoryStore:
     def cursor(self, subscription: str) -> int:
         return self._cursors.get(subscription, 0)
 
-    def idempotency(self, key: str) -> Json | None:
-        return deepcopy(self._idempotency.get(key))
+    def idempotency(self, actor: str, key: str) -> Json | None:
+        return deepcopy(self._idempotency.get((actor, key)))
 
     def audit(self) -> list[AuditEntry]:
         return list(self._audit)
 
-    def commit(self, commit: Commit) -> None:
+    def secret(self, key: UUID) -> bytes | None:
+        return self._secrets.get(key)
+
+    def rehearse(self, commit: Commit) -> None:
+        self._check(commit)
+
+    def _check(self, commit: Commit) -> None:
         for document in commit.documents:
             stored = self._documents[document.kind].get(document.id)
             if stored and stored.final:
-                raise RemitError(f"{document.kind} {document.id} is final and cannot change")
+                raise Rejected(f"{document.kind} {document.id} is final and cannot change")
             if (stored.version if stored else 0) != document.version - 1:
                 raise ConcurrencyError(f"{document.kind} {document.id} changed since it was read")
+        if commit.idempotency and commit.idempotency[:2] in self._idempotency:
+            raise ConcurrencyError("the idempotency key was claimed since it was read")
 
+    def commit(self, commit: Commit) -> None:
+        self._check(commit)
         for document in commit.documents:
             self._documents[document.kind][document.id] = document
         for name, body in commit.events:
@@ -161,8 +213,14 @@ class MemoryStore:
             subscription, position = commit.cursor
             self._cursors[subscription] = position
         if commit.idempotency:
-            key, record = commit.idempotency
-            self._idempotency[key] = record
+            actor, key, record = commit.idempotency
+            self._idempotency[actor, key] = record
+        for data_key in commit.keys:
+            self._secrets[data_key.id] = data_key.secret
+            self._subjects[data_key.id] = set(data_key.subjects)
+        erased = set(commit.erasures)
+        for key_id in [k for k, subjects in self._subjects.items() if subjects & erased]:
+            del self._secrets[key_id], self._subjects[key_id]
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
         raise RemitError("this needs a PostgreSQL store; the memory store cannot run SQL")

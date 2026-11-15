@@ -12,8 +12,9 @@ CREATE TABLE IF NOT EXISTS ledger_books (
     PRIMARY KEY (account, currency)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ledger_account_code
-    ON documents ((body ->> 'code')) WHERE kind = 'ledger.account';
+-- Account codes are unique through `Account.unique`, which the kernel indexes. Earlier
+-- versions indexed them here, under a name the kernel does not manage; remove it.
+DROP INDEX IF EXISTS ledger_account_code;
 
 -- pgledger only ever inserts into these two tables, so nothing legitimate is blocked.
 CREATE OR REPLACE TRIGGER pgledger_transfers_append_only
@@ -74,3 +75,9 @@ CREATE OR REPLACE TRIGGER ledger_journal_entry
     BEFORE INSERT ON documents
     FOR EACH ROW WHEN (NEW.kind = 'ledger.journal_entry')
     EXECUTE FUNCTION ledger_check_journal_entry();
+
+-- The books are history: they are never emptied wholesale, any more than row by row.
+SELECT remit_forbid_truncate(target) FROM unnest(ARRAY[
+    'ledger_books', 'pgledger_accounts', 'pgledger_transfers', 'pgledger_entries',
+    'pgledger_idempotency_keys'
+]::regclass[]) AS target;

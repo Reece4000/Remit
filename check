@@ -2,7 +2,7 @@
 # Everything that must pass before code is shared. Run it from anywhere:
 #
 #   ./check          format, lint, types, and the full test suite on PostgreSQL
-#   ./check --deep   the above, then prove the tests have teeth (about a minute)
+#   ./check --deep   the above, then audit dependencies and prove the tests have teeth
 #
 # There is no hosted CI; this is the gate. To run it automatically before every push:
 #
@@ -11,9 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [[ ! -x .venv/bin/pytest ]]; then
-    echo "No virtualenv yet. Create one with:" >&2
-    echo "  python3.14 -m venv .venv && .venv/bin/pip install -e . --group dev" >&2
+if ! command -v uv >/dev/null; then
+    echo "uv is required: https://docs.astral.sh/uv/ (brew install uv)" >&2
     exit 1
 fi
 
@@ -22,6 +21,10 @@ fi
 export REMIT_REQUIRE_POSTGRES=1
 
 step() { printf '\n== %s\n' "$1"; }
+
+step "environment"
+# Exactly the versions in uv.lock. Fails if pyproject.toml has changed without a relock.
+uv sync --locked --quiet
 
 step "format"
 .venv/bin/ruff format --check .
@@ -33,9 +36,18 @@ step "types"
 .venv/bin/pyright
 
 step "tests"
-.venv/bin/pytest -q
+.venv/bin/coverage run -m pytest -q
+
+step "coverage"
+.venv/bin/coverage report
+
+# The floor may rise but never fall below the one on main.
+.venv/bin/python checks/floor.py
 
 if [[ "${1:-}" == "--deep" ]]; then
+    step "deep: known vulnerabilities in dependencies"
+    .venv/bin/pip-audit --skip-editable --progress-spinner off
+
     step "deep: mutations and repeated races"
     .venv/bin/python checks/deep.py
 fi

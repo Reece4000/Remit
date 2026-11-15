@@ -7,28 +7,33 @@ events to subscriptions, each delivery its own unit of work.
 Every unit is a serialisable transaction, so the checks a handler makes still hold when
 it commits, whatever else is running. When the store cannot serialise a unit, the kernel
 runs it again; handlers only touch the context, which makes that safe.
+
+Reads (`get`, `find`, `sql`, `events`, `audit`) run in read-only units: nothing can be
+changed through them, and on PostgreSQL they wait for a snapshot that can never
+conflict, so they are never aborted.
 """
 
 import random
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from functools import partial
+from functools import cache, partial
 from typing import Any, cast
 from uuid import UUID
 
 from pydantic import BaseModel
 
 from .actor import Actor, ActorKind
-from .codec import Codec
+from .codec import Codec, unstorable
 from .context import Context
 from .document import Document
 from .errors import ConcurrencyError, RegistrationError, Rejected, RemitError, Unauthorised
 from .message import Command, Outcome, Recorded
-from .module import Module, Subscription
+from .module import CommandSpec, Module, Subscription
+from .personal import DataKey, carries_personal, seal, unseal
 from .registry import Registry
-from .store import AuditEntry, Commit, Json, MemoryStore, Store, Unit
+from .store import AuditEntry, Commit, Json, MemoryStore, Store, SubjectKey, Unit
 
 _READER = Actor(id="system:kernel", kind=ActorKind.SYSTEM)
 
@@ -69,6 +74,10 @@ class Kernel:
                 )
             if (module.migrations or module.sql) and not self.store.runs_sql:
                 raise RegistrationError(f"module {module.name!r} needs a PostgreSQL store")
+        if problems := self.store.missing(tuple(self.registry.modules.values())):
+            raise RegistrationError(
+                "; ".join(problems) + "; install the modules into the store before running them"
+            )
 
     def execute[R](
         self,
@@ -82,24 +91,30 @@ class Kernel:
         spec = self.registry.command(type(command))
         if not actor.may(spec.name):
             raise Unauthorised(f"{actor.id} does not hold the permission {spec.name}")
-        key = f"{actor.id}:{idempotency_key}" if idempotency_key else None
 
         def work(unit: Unit) -> Outcome[R]:
-            if key and (seen := unit.idempotency(key)):
+            if idempotency_key and (stored := unit.idempotency(actor.id, idempotency_key)):
+                seen = _opened(unit, stored)
+                if seen is None:
+                    raise Rejected(
+                        f"the record of idempotency key {idempotency_key!r} was erased with the "
+                        "personal data it held; send the command again with a new key"
+                    )
                 if seen["command"] != command.model_dump(mode="json"):
                     raise Rejected(
                         f"idempotency key {idempotency_key!r} was already used for another command"
                     )
                 return cast(Outcome[R], self._codec.load_outcome(spec, seen))
 
-            context = self._context(unit, actor)
+            context = self._context(unit, actor, spec.module)
             result = spec.handler(command, context)
+            context.finish()
             outcome = Outcome(result, context.written, context.emitted, committed=not dry_run)
-            if dry_run:
-                unit.rollback()
-            else:
-                record = (key, self._codec.dump_outcome(spec, command, outcome)) if key else None
-                unit.commit(self._commit(context, spec.name, command, idempotency=record))
+            replay = (actor.id, idempotency_key, spec, outcome) if idempotency_key else None
+            commit = self._commit(context, spec.name, command, replay=replay)
+            # A dry run sends the commit too, and then undoes it, so that it is refused for
+            # the same reasons as the real thing, including rules the database enforces.
+            (unit.rehearse if dry_run else unit.commit)(commit)
             return outcome
 
         return self._in_unit(work)
@@ -126,25 +141,38 @@ class Kernel:
         return Dispatched(delivered, tuple(failures))
 
     def get[D: Document](self, kind: type[D], id: UUID) -> D:
-        return self._in_unit(lambda unit: self._context(unit, _READER).get(kind, id))
+        return self._read(lambda unit: self._context(unit, _READER).get(kind, id))
 
-    def find[D: Document](self, kind: type[D], **equals: object) -> list[D]:
-        return self._in_unit(lambda unit: self._context(unit, _READER).find(kind, **equals))
+    def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]:
+        return self._read(lambda unit: self._context(unit, _READER).find(kind, **equals))
 
     def settings[S: BaseModel](self, kind: type[S]) -> S:
         return cast(S, self._settings[kind])
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
-        return self._in_unit(lambda unit: unit.sql(query, parameters))
+        """Read from the database. Nothing can be changed this way; commands change things."""
+        return self._read(lambda unit: unit.sql(query, parameters))
 
     def events(self, *, after: int = 0) -> list[Recorded]:
         """The event log, in the order events were committed."""
-        stored = self._in_unit(lambda unit: unit.events(after=after))
+        stored = self._read(lambda unit: unit.events(after=after))
         return [self._codec.load_event(event) for event in stored]
 
     def audit(self) -> list[AuditEntry]:
-        """Every command and delivery that committed, oldest first."""
-        return self._in_unit(lambda unit: unit.audit())
+        """Every command and delivery that committed, oldest first.
+
+        Personal values read as they were given, or as `ERASED` once their subject has
+        been erased.
+        """
+
+        def read(unit: Unit) -> list[AuditEntry]:
+            secret = cache(unit.secret)
+            return [
+                replace(entry, input=unseal(entry.input, secret, entry.key))
+                for entry in unit.audit()
+            ]
+
+        return self._read(read)
 
     def _deliver(self, subscription: Subscription, unit: Unit) -> DeliveryFailure | bool:
         """Deliver the subscription's next event. False when it has none waiting."""
@@ -154,43 +182,53 @@ class Kernel:
             return False
         recorded = self._codec.load_event(waiting[0])
         actor = Actor(id=f"system:{subscription.module}", kind=ActorKind.SYSTEM)
-        context = self._context(unit, actor)
+        context = self._context(unit, actor, subscription.module)
         try:
             subscription.handler(recorded.event, context)
+            context.finish()
+            unit.commit(
+                self._commit(
+                    context,
+                    subscription.name,
+                    recorded.event,
+                    cause=recorded.position,
+                    cursor=(subscription.name, recorded.position),
+                )
+            )
         except ConcurrencyError:
             raise
-        except RemitError as error:
+        except Exception as error:
+            # Whatever went wrong, in the handler or in committing what it did, went wrong
+            # in this subscription alone: it keeps its place, and every other subscription
+            # is still delivered to.
             unit.rollback()
-            return DeliveryFailure(subscription.name, recorded.position, str(error))
-        unit.commit(
-            self._commit(
-                context,
-                subscription.name,
-                recorded.event,
-                cause=recorded.position,
-                cursor=(subscription.name, recorded.position),
-            )
-        )
+            reason = str(error) if isinstance(error, RemitError) else _described(error)
+            return DeliveryFailure(subscription.name, recorded.position, reason)
         return True
 
-    def _in_unit[T](self, work: Callable[[Unit], T]) -> T:
+    def _read[T](self, work: Callable[[Unit], T]) -> T:
+        return self._in_unit(work, read_only=True)
+
+    def _in_unit[T](self, work: Callable[[Unit], T], *, read_only: bool = False) -> T:
         for attempt in range(1, self._attempts + 1):
             try:
-                with self.store.unit() as unit:
+                with self.store.unit(read_only=read_only) as unit:
                     return work(unit)
             except ConcurrencyError:
                 if attempt == self._attempts:
                     raise
-                time.sleep(random.uniform(0, 0.002 * 2**attempt))
+                time.sleep(random.uniform(0, 0.002 * 2**attempt))  # noqa: S311  jitter, not secrecy
         raise AssertionError("unreachable")
 
-    def _context(self, unit: Unit, actor: Actor) -> Context:
+    def _context(self, unit: Unit, actor: Actor, module: str = "") -> Context:
+        """A context for code of `module`. Readers belong to no module and write nothing."""
         return Context(
             actor=actor,
             now=self._clock(),
             unit=unit,
             registry=self.registry,
             settings=self._settings,
+            module=module,
         )
 
     def _commit(
@@ -201,17 +239,78 @@ class Kernel:
         *,
         cause: int | None = None,
         cursor: tuple[str, int] | None = None,
-        idempotency: tuple[str, Json] | None = None,
+        replay: tuple[str, str, CommandSpec, Outcome[Any]] | None = None,
     ) -> Commit:
+        """Everything the unit changes, with personal values sealed under a new data key.
+
+        Refused if any of it holds text no store can keep, so that every store refuses
+        the same things.
+        """
+        data_key = DataKey()
+        sealed_input = seal(input, input.model_dump(mode="json"), data_key)
+        idempotency: tuple[str, str, Json] | None = None
+        if replay:
+            actor, key, spec, outcome = replay
+            record = self._codec.dump_outcome(spec, cast(Command[Any], input), outcome, data_key)
+            sealed = {**record, "key": str(data_key.id)} if data_key.used else record
+            idempotency = (actor, key, sealed)
+
+        keys: tuple[SubjectKey, ...] = ()
+        if data_key.used:
+            # A subject erased in this unit holds nothing personal any more, so the new key
+            # is not linked to it: if it were, the erasure would delete the key of its own
+            # record, and a retry of the erasure could never be answered.
+            erased = set(context.erasures)
+            subjects = tuple(
+                d.id for d in context.written if carries_personal(type(d)) and d.id not in erased
+            )
+            if not subjects:
+                raise RemitError(
+                    f"{action} carries personal data but writes no document it belongs to, "
+                    "so it could never be erased; personal values belong in data subjects"
+                )
+            keys = (SubjectKey(data_key.id, data_key.secret, subjects),)
+
         documents = tuple(self._codec.dump(document) for document in context.written)
         events = tuple(self._codec.dump_event(event) for event in context.emitted)
+        kept = [
+            ("input", sealed_input),
+            *((d.kind, d.body) for d in documents),
+            *events,
+            *([("result", idempotency[2]["result"])] if idempotency else []),
+        ]
+        if problem := next(filter(None, (unstorable(body, where) for where, body in kept)), None):
+            raise Rejected(f"{action}: {problem}")
         audit = AuditEntry(
             at=context.now,
             actor=context.actor,
             action=action,
-            input=input.model_dump(mode="json"),
+            input=sealed_input,
             documents=tuple((d.kind, d.id, d.version) for d in documents),
             events=tuple(name for name, _ in events),
             cause=cause,
+            key=data_key.id if data_key.used else None,
         )
-        return Commit(documents, events, audit, cursor=cursor, idempotency=idempotency)
+        return Commit(
+            documents,
+            events,
+            audit,
+            cursor=cursor,
+            idempotency=idempotency,
+            keys=keys,
+            erasures=context.erasures,
+        )
+
+
+def _described(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+
+
+def _opened(unit: Unit, record: Json) -> Json | None:
+    """An idempotency record with its personal values opened; None if they were erased."""
+    if "key" not in record:
+        return record
+    key = UUID(record["key"])
+    if unit.secret(key) is None:
+        return None
+    return cast(Json, unseal(record, unit.secret, key))

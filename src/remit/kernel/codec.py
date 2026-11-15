@@ -9,6 +9,7 @@ from .document import Document
 from .errors import RemitError
 from .message import Command, Event, Outcome, Recorded
 from .module import CommandSpec
+from .personal import DataKey, seal
 from .registry import Registry
 from .store import Json, StoredDocument, StoredEvent
 
@@ -27,11 +28,18 @@ class Codec:
     def load[D: Document](self, kind: type[D], body: Json) -> D:
         return kind.model_validate(body)
 
-    def filters(self, equals: Mapping[str, object]) -> dict[str, object]:
+    def filters(self, kind: type[Document], equals: Mapping[str, object]) -> dict[str, object]:
+        """`equals` as JSON scalars a store can match, refusing fields `kind` does not have.
+
+        A misspelt field must not quietly match everything, or nothing.
+        """
+        if unknown := sorted(equals.keys() - kind.model_fields.keys()):
+            name = self._registry.document_name(kind)
+            raise RemitError(f"cannot find {name} by {', '.join(unknown)}: it has no such field")
         encoded = {field: to_jsonable_python(value) for field, value in equals.items()}
         for field, value in encoded.items():
             if isinstance(value, (dict, list)):
-                raise ValueError(f"cannot filter on {field}: only scalar fields can be matched")
+                raise RemitError(f"cannot filter on {field}: only scalar fields can be matched")
         return encoded
 
     def dump_event(self, event: Event) -> tuple[str, Json]:
@@ -41,12 +49,20 @@ class Codec:
         event = self._registry.event_type(stored.name).model_validate(stored.body)
         return Recorded(stored.position, stored.name, event, stored.at, stored.actor)
 
-    def dump_outcome(self, spec: CommandSpec, command: Command[Any], outcome: Outcome[Any]) -> Json:
+    def dump_outcome(
+        self, spec: CommandSpec, command: Command[Any], outcome: Outcome[Any], key: DataKey
+    ) -> Json:
+        """What an idempotent command did, with its personal values sealed under `key`."""
         return {
-            "command": command.model_dump(mode="json"),
-            "result": spec.returns.dump_python(outcome.result, mode="json"),
+            "command": seal(command, command.model_dump(mode="json"), key),
+            "result": seal(
+                outcome.result, spec.returns.dump_python(outcome.result, mode="json"), key
+            ),
             "documents": [
-                [stored.kind, stored.body] for stored in map(self.dump, outcome.documents)
+                [stored.kind, seal(document, stored.body, key)]
+                for document, stored in zip(
+                    outcome.documents, map(self.dump, outcome.documents), strict=True
+                )
             ],
             "events": [list(self.dump_event(event)) for event in outcome.events],
         }
@@ -65,3 +81,31 @@ class Codec:
             committed=True,
             replayed=True,
         )
+
+
+def unstorable(value: object, path: str = "") -> str | None:
+    """Where JSON holds text that no store can keep, if it does.
+
+    PostgreSQL's JSON cannot hold a NUL character, and no store can encode a lone
+    surrogate. Shared field types (`Name`, `SingleLine`) refuse them on input; this
+    catches them in any other field, so that every store refuses the same writes.
+    """
+    if isinstance(value, str):
+        for character in value:
+            if character == "\x00" or "\ud800" <= character <= "\udfff":
+                return (
+                    f"{path or 'a value'} contains U+{ord(character):04X}, which cannot be stored"
+                )
+        return None
+    if isinstance(value, dict):
+        entries: dict[str, Any] = value  # pyright: ignore[reportUnknownVariableType]
+        for name, part in entries.items():
+            where = f"{path}.{name}" if path else name
+            if problem := unstorable(name, where) or unstorable(part, where):
+                return problem
+    if isinstance(value, list):
+        parts: list[Any] = value  # pyright: ignore[reportUnknownVariableType]
+        for number, part in enumerate(parts):
+            if problem := unstorable(part, f"{path}[{number}]"):
+                return problem
+    return None

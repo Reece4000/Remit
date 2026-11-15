@@ -50,6 +50,12 @@ class Document(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     lifecycle: ClassVar[Lifecycle]
+    unique: ClassVar[tuple[str, ...]] = ()
+    """Fields no two documents of this kind may share, whatever their state.
+
+    The kernel refuses a write that would duplicate one, and on PostgreSQL a unique index
+    makes the database refuse it too.
+    """
 
     id: UUID = Field(default_factory=uuid7)
     state: str = ""

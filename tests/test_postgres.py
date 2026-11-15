@@ -9,14 +9,28 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from conftest import DSN
-from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, desk
+from conftest import DSN, kernel_on
+from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, TicketResolved, desk
 
-from remit import ledger
-from remit.kernel import Actor, ActorKind, Kernel, Money, PostgresStore, Rejected
+from remit import items, ledger, parties
+from remit.kernel import (
+    Actor,
+    ActorKind,
+    Command,
+    Context,
+    Document,
+    Kernel,
+    Lifecycle,
+    Module,
+    Money,
+    PostgresStore,
+    Rejected,
+    RemitError,
+)
 from remit.ledger import AccountType, credit, debit
 
 BOOKKEEPER = Actor(id="bookkeeper", kind=ActorKind.HUMAN, permissions=frozenset({"ledger.*"}))
+CLERK = Actor(id="clerk", kind=ActorKind.HUMAN, permissions=frozenset({"parties.*", "items.*"}))
 JAN_31 = date(2026, 1, 31)
 
 
@@ -26,10 +40,10 @@ def gbp(amount: str) -> Money:
 
 @pytest.fixture
 def kernel(postgres: PostgresStore) -> Kernel:
-    return Kernel(
-        [ledger.module, desk],
+    return kernel_on(
+        postgres,
+        [ledger.module, desk, parties.module, items.module],
         settings=[ledger.LedgerSettings(base_currency="GBP")],
-        store=postgres,
     )
 
 
@@ -121,10 +135,57 @@ def test_the_database_itself_refuses_to_alter_history(kernel: Kernel, accounts) 
         "DELETE FROM events",
         "UPDATE audit SET action = 'nothing happened'",
         "DELETE FROM audit",
+        "TRUNCATE audit",
+        "TRUNCATE events",
+        "TRUNCATE documents",
+        "TRUNCATE data_keys CASCADE",
+        "TRUNCATE cursors, idempotency",
+        "TRUNCATE pgledger_entries CASCADE",
+        "TRUNCATE ledger_books",
     ]
     for statement in tampering:
         with pytest.raises(psycopg.errors.IntegrityError), psycopg.connect(DSN) as connection:
             connection.execute(statement.encode())
+
+
+def test_the_database_itself_refuses_a_duplicate_code(kernel: Kernel) -> None:
+    command = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+    kernel.execute(command, actor=CLERK)
+    copy = {"code": "C0001", "kind": "person", "name": "Impostor", "state": "active"}
+    with pytest.raises(psycopg.errors.UniqueViolation), psycopg.connect(DSN) as connection:
+        connection.execute(
+            "INSERT INTO documents (kind, id, version, final, body) "
+            "VALUES ('parties.party', %s, 1, false, %s)",
+            (uuid4(), json.dumps({**copy, "id": str(uuid4())})),
+        )
+
+
+def test_personal_data_is_stored_only_sealed(kernel: Kernel) -> None:
+    amy = kernel.execute(
+        parties.RegisterParty(code="P0001", kind=parties.PartyKind.PERSON, name="Amy Shaw"),
+        actor=CLERK,
+        idempotency_key="register-amy",
+    ).result
+    kernel.execute(
+        parties.AddContact(party_id=amy.id, name="Amy Shaw", email="amy@example.com"),
+        actor=CLERK,
+    )
+
+    with psycopg.connect(DSN) as connection:
+        (kept,) = connection.execute(
+            "SELECT (SELECT string_agg(input::text, ' ') FROM audit) || "
+            "(SELECT string_agg(record::text, ' ') FROM idempotency)"
+        ).fetchone() or ("",)
+    assert "Amy Shaw" not in kept
+    assert "amy@example.com" not in kept
+    assert "P0001" in kept, "codes are not personal and stay readable"
+
+    kernel.execute(parties.EraseParty(party_id=amy.id), actor=CLERK)
+    with psycopg.connect(DSN) as connection:
+        (left,) = connection.execute(
+            "SELECT count(*) FROM data_key_subjects WHERE subject = %s", (amy.id,)
+        ).fetchone() or (None,)
+    assert left == 0
 
 
 def test_pgledger_itself_refuses_a_transfer_into_a_closed_period(kernel: Kernel, accounts) -> None:
@@ -163,6 +224,43 @@ def test_one_account_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel
     assert sum(isinstance(result, ledger.Account) for result in results) == 1
     assert sum(isinstance(result, Rejected) for result in results) == 7
     assert len(kernel.find(ledger.Account)) == 1
+
+
+def test_one_party_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
+    claim = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+
+    results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
+
+    assert sum(isinstance(result, parties.Party) for result in results) == 1
+    assert sum(isinstance(result, Rejected) for result in results) == 7
+    assert len(kernel.find(parties.Party)) == 1
+
+
+def test_one_item_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
+    claim = items.AddItem(code="BOLT-M8", kind=items.ItemKind.GOODS, name="Hex bolt")
+
+    results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
+
+    assert sum(isinstance(result, items.Item) for result in results) == 1
+    assert sum(isinstance(result, Rejected) for result in results) == 7
+    assert len(kernel.find(items.Item)) == 1
+
+
+def test_of_many_amendments_from_the_same_copy_exactly_one_lands(kernel: Kernel) -> None:
+    command = parties.RegisterParty(code="C0001", kind=parties.PartyKind.PERSON, name="Amy")
+    amy = kernel.execute(command, actor=CLERK).result
+
+    def amend(number: int) -> parties.Party:
+        renamed = parties.AmendParty(
+            party_id=amy.id, version=amy.version, name=f"Amy {number}", tax_number=None
+        )
+        return kernel.execute(renamed, actor=CLERK).result
+
+    results = race(8, amend)
+
+    [landed] = [result for result in results if isinstance(result, parties.Party)]
+    assert all("has changed since version 1" in str(r) for r in results if r is not landed)
+    assert kernel.get(parties.Party, amy.id) == landed
 
 
 def test_an_entry_is_reversed_by_exactly_one_of_many_attempts(kernel: Kernel, accounts) -> None:
@@ -226,3 +324,94 @@ def test_many_workers_deliver_each_event_exactly_once(kernel: Kernel) -> None:
     assert sum(result for result in results if isinstance(result, int)) == 20
     assert len(kernel.find(Notice)) == 20
     assert len({notice.ticket_id for notice in kernel.find(Notice)}) == 20
+
+
+def test_nothing_can_be_changed_through_the_kernels_reads(kernel: Kernel) -> None:
+    ticket = kernel.execute(OpenTicket(subject="Printer"), actor=AGENT).result
+
+    with pytest.raises(RemitError, match="nothing can be changed through a read"):
+        kernel.sql('UPDATE documents SET body = body || \'{"subject": "Edited"}\'')
+    with pytest.raises(RemitError, match="nothing can be changed through a read"):
+        kernel.sql("INSERT INTO cursors (subscription, position) VALUES ('desk.x', 99)")
+    assert kernel.get(type(ticket), ticket.id) == ticket
+    assert len(kernel.audit()) == 1
+
+
+# A module whose rule lives only in the database, as a trigger.
+
+vault = Module(
+    "vault",
+    sql="""
+    CREATE OR REPLACE FUNCTION vault_refuse_secrets() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.body ->> 'text' = 'secret' THEN
+            RAISE EXCEPTION 'secrets are not kept here' USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END $$;
+    CREATE OR REPLACE TRIGGER vault_refuse_secrets BEFORE INSERT ON documents
+        FOR EACH ROW WHEN (NEW.kind = 'vault.note') EXECUTE FUNCTION vault_refuse_secrets();
+    """,
+)
+
+
+@vault.document
+class Note(Document):
+    """A note."""
+
+    lifecycle = Lifecycle(initial="kept")
+
+    text: str
+
+
+class KeepNote(Command[Note]):
+    text: str
+
+
+@vault.command
+def keep_note(command: KeepNote, context: Context) -> Note:
+    """Keep a note."""
+    return context.create(Note(text=command.text))
+
+
+def test_a_dry_run_is_refused_by_rules_the_database_enforces(postgres: PostgresStore) -> None:
+    kernel = kernel_on(postgres, [vault])
+
+    with pytest.raises(Rejected, match="the database refused this: secrets are not kept here"):
+        kernel.execute(KeepNote(text="secret"), actor=AGENT_EVERYWHERE, dry_run=True)
+    with pytest.raises(Rejected, match="secrets are not kept here"):
+        kernel.execute(KeepNote(text="secret"), actor=AGENT_EVERYWHERE)
+
+    preview = kernel.execute(KeepNote(text="shopping"), actor=AGENT_EVERYWHERE, dry_run=True)
+    assert not preview.committed
+    assert kernel.find(Note) == []
+    assert kernel.audit() == []
+
+
+AGENT_EVERYWHERE = Actor(id="agent:all", kind=ActorKind.AGENT, permissions=frozenset({"*"}))
+
+
+archivist = Module("archivist", requires=(vault, desk))
+
+
+@archivist.subscribe(TicketResolved)
+def file_secretly(event: TicketResolved, context: Context) -> None:
+    """Keep a note the vault's database rule refuses when the unit commits."""
+    context.execute(KeepNote(text="secret"))
+
+
+def test_a_delivery_the_database_refuses_does_not_stop_the_others(
+    postgres: PostgresStore,
+) -> None:
+    kernel = kernel_on(postgres, [archivist])
+    ticket = kernel.execute(OpenTicket(subject="Printer"), actor=AGENT).result
+    kernel.execute(
+        MoveTicket(ticket_id=ticket.id, transition="resolve", resolution="Done"), actor=AGENT
+    )
+
+    dispatched = kernel.dispatch()
+
+    [failure] = dispatched.failures
+    assert failure.subscription == "archivist.file_secretly"
+    assert "secrets are not kept here" in failure.error
+    assert len(kernel.find(Notice)) == 1

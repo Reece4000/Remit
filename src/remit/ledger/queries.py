@@ -11,10 +11,15 @@ from remit.kernel import Money, Reader
 from .books import CLEARING, Book, start_of
 from .model import Account, LedgerSettings, PeriodClose
 
+# Both take the account to read, twice, or null for every account. Reading only the books asked
+# for matters beyond speed: a serialisable unit conflicts with whatever writes what it
+# read, so a balance check on one account must not read every other account's books.
+
 _CURRENT = """
     SELECT book.account, book.currency, held.balance
     FROM ledger_books AS book
     JOIN pgledger_accounts_view AS held ON held.id = book.pgledger_account
+    WHERE %s::uuid IS NULL OR book.account = %s
 """
 
 _AS_OF = """
@@ -22,6 +27,7 @@ _AS_OF = """
     FROM ledger_books AS book
     LEFT JOIN pgledger_entries_view AS entry
         ON entry.account_id = book.pgledger_account AND entry.event_at < %s
+    WHERE %s::uuid IS NULL OR book.account = %s
     GROUP BY book.account, book.currency
 """
 
@@ -57,8 +63,7 @@ def balance(reader: Reader, account_id: UUID, *, as_of: date | None = None) -> B
     base = reader.settings(LedgerSettings).base_currency
     held = {
         currency: Money.of(amount, currency)
-        for (account, currency), amount in _books(reader, as_of).items()
-        if account == account_id
+        for (_, currency), amount in _books(reader, as_of, account_id).items()
     }
     return Balance(held.pop(base, Money.zero(base)), held)
 
@@ -67,7 +72,7 @@ def trial_balance(reader: Reader, *, as_of: date | None = None) -> dict[UUID, Mo
     """Every account's base-currency balance. The values always sum to zero."""
     base = reader.settings(LedgerSettings).base_currency
     totals = {account.id: Money.zero(base) for account in reader.find(Account)}
-    for (account, currency), amount in _books(reader, as_of).items():
+    for (account, currency), amount in _books(reader, as_of, None).items():
         if currency == base and account != CLEARING:
             totals[account] = Money.of(amount, base)
     return totals
@@ -95,9 +100,9 @@ def reconcile(reader: Reader) -> list[str]:
     return problems
 
 
-def _books(reader: Reader, as_of: date | None) -> dict[Book, Decimal]:
+def _books(reader: Reader, as_of: date | None, account: UUID | None) -> dict[Book, Decimal]:
     if as_of is None:
-        rows = reader.sql(_CURRENT)
+        rows = reader.sql(_CURRENT, (account, account))
     else:
-        rows = reader.sql(_AS_OF, (start_of(as_of + timedelta(days=1)),))
+        rows = reader.sql(_AS_OF, (start_of(as_of + timedelta(days=1)), account, account))
     return {(account, currency): amount for account, currency, amount in rows}

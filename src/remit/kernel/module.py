@@ -7,7 +7,7 @@ derived from these declarations, so each one must carry a docstring.
 
 import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Container, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 type Handler[M, R] = Callable[[M, Context], R]
 
+_NAME = re.compile(r"[a-z][a-z0-9_]*")
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -34,8 +36,11 @@ class Migration:
 @dataclass(frozen=True)
 class CommandSpec:
     name: str
+    module: str
     command: type[Command[Any]]
     handler: Handler[Any, Any]
+    result: Any
+    """The return annotation, from which `returns` is built."""
     returns: TypeAdapter[Any]
     summary: str
 
@@ -54,11 +59,19 @@ class Module:
         self,
         name: str,
         *,
+        requires: tuple[Module, ...] = (),
         settings: type[BaseModel] | None = None,
         migrations: tuple[Migration, ...] = (),
         sql: str = "",
     ) -> None:
+        if not _NAME.fullmatch(name):
+            raise RegistrationError(
+                f"module name {name!r} must be lower case letters, digits and underscores, "
+                "starting with a letter: it prefixes every name the module declares, so it "
+                "cannot contain the dot that separates the two"
+            )
         self.name = name
+        self._requires = requires
         self.settings = settings
         self.migrations = migrations
         """Schema changes, each applied once, in order, when a PostgreSQL store is installed."""
@@ -68,6 +81,15 @@ class Module:
         self.events: dict[str, type[Event]] = {}
         self.commands: dict[str, CommandSpec] = {}
         self.subscriptions: list[Subscription] = []
+
+    @property
+    def requires(self) -> tuple[Module, ...]:
+        """The modules this one builds on: it may use their public API and react to their events.
+
+        A dependency is a module object, so it must exist before the module that names
+        it, and requirements cannot change afterwards. A cycle therefore cannot be declared.
+        """
+        return self._requires
 
     def document[D: Document](self, kind: type[D]) -> type[D]:
         """Declare a document type."""
@@ -83,31 +105,69 @@ class Module:
 
     def command[C: Command[Any], R](self, handler: Handler[C, R]) -> Handler[C, R]:
         """Declare a command by its handler; the command type is the first parameter's."""
-        command, returns = _signature(handler)
-        name = self._claim(command.__name__, self.commands)
-        self.commands[name] = CommandSpec(name, command, handler, returns, _summary(handler))
+        command, result = _signature(handler)
+        name = self._claim(command.__name__, self._actions)
+        self.commands[name] = CommandSpec(
+            name, self.name, command, handler, result, TypeAdapter(result), _summary(handler)
+        )
         return handler
 
-    def subscribe[E: Event](self, event: type[E]) -> Callable[[Handler[E, None]], Handler[E, None]]:
-        """Declare a reaction to an event, from this module or any other."""
+    def subscribe[E: Event](
+        self, event: type[E], *, name: str | None = None
+    ) -> Callable[[Handler[E, None]], Handler[E, None]]:
+        """Declare a reaction to an event, from this module or any other.
+
+        A subscription's name is where it keeps its place in the event log, so renaming
+        it would deliver every event to it again from the start. It defaults to the
+        handler's name; give `name` to keep it fixed while the handler is renamed.
+        """
 
         def declare(handler: Handler[E, None]) -> Handler[E, None]:
-            name = f"{self.name}.{handler.__name__}"
+            chosen = handler.__name__ if name is None else name
+            if not _NAME.fullmatch(chosen):
+                raise RegistrationError(
+                    f"subscription name {chosen!r} must be lower case letters, digits and "
+                    "underscores, starting with a letter"
+                )
+            claimed = self._claim(chosen, self._actions)
             self.subscriptions.append(
-                Subscription(name, self.name, event, handler, _summary(handler))
+                Subscription(claimed, self.name, event, handler, _summary(handler))
             )
             return handler
 
         return declare
 
-    def _claim(self, class_name: str, taken: dict[str, Any]) -> str:
-        name = f"{self.name}.{re.sub(r'(?<!^)(?=[A-Z])', '_', class_name).lower()}"
+    @property
+    def _actions(self) -> set[str]:
+        """Names of commands and subscriptions: both name the action in the audit trail."""
+        return {*self.commands, *(subscription.name for subscription in self.subscriptions)}
+
+    def _claim(self, declared: str, taken: Container[str]) -> str:
+        name = f"{self.name}.{re.sub(r'(?<!^)(?=[A-Z])', '_', declared).lower()}"
         if name in taken:
             raise RegistrationError(f"{name} is declared twice")
         return name
 
 
-def _signature(handler: Callable[..., Any]) -> tuple[type[Command[Any]], TypeAdapter[Any]]:
+def installation_order(modules: Iterable[Module]) -> tuple[Module, ...]:
+    """The given modules and everything they require, each after all of its dependencies.
+
+    Otherwise modules keep the order they were given in, so installation is deterministic.
+    """
+    ordered: dict[int, Module] = {}
+
+    def visit(module: Module) -> None:
+        if id(module) not in ordered:
+            for dependency in module.requires:
+                visit(dependency)
+            ordered[id(module)] = module
+
+    for module in modules:
+        visit(module)
+    return tuple(ordered.values())
+
+
+def _signature(handler: Callable[..., Any]) -> tuple[type[Command[Any]], Any]:
     signature = inspect.signature(handler, eval_str=True)
     parameters = list(signature.parameters.values())
     command = parameters[0].annotation if parameters else None
@@ -117,7 +177,7 @@ def _signature(handler: Callable[..., Any]) -> tuple[type[Command[Any]], TypeAda
         )
     if signature.return_annotation is inspect.Signature.empty:
         raise RegistrationError(f"{handler.__qualname__} must declare what it returns")
-    return cast(type[Command[Any]], command), TypeAdapter(signature.return_annotation)
+    return cast(type[Command[Any]], command), signature.return_annotation
 
 
 def _summary(declared: Any) -> str:

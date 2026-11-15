@@ -6,10 +6,23 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "src/remit/ledger/vendor/pgledger/LICENSE*"]
 requires-python = ">=3.14"
-dependencies = ["psycopg[binary,pool]>=3.2", "pydantic>=2.12"]
+dependencies = [
+    "cryptography>=46",
+    "iso4217>=1.16.20260101",
+    "psycopg[binary,pool]>=3.2",
+    "pycountry>=24.6",
+    "pydantic[email]>=2.12",
+]
 
 [dependency-groups]
-dev = ["hypothesis>=6.140", "pyright>=1.1.400", "pytest>=8.4", "ruff>=0.14"]
+dev = [
+    "coverage>=7.10",
+    "hypothesis>=6.140",
+    "pip-audit>=2.9",
+    "pyright>=1.1.400",
+    "pytest>=8.4",
+    "ruff>=0.14",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,13 +33,33 @@ packages = ["src/remit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+select = [
+    "E", "F", "I", "UP", "B", "SIM", "RUF",
+    "C4", "PIE", "PT", "PERF", "FURB", "PLR0402",
+    "S",  # security
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+"checks/**" = ["S101"]
+
+[tool.coverage.run]
+branch = true
+source = ["remit"]
+
+[tool.coverage.report]
+# A floor, not a target: raise it as gaps are closed, never lower it.
+fail_under = 98.1
+precision = 1
+show_missing = true
+skip_covered = true
 
 [tool.pyright]
 include = ["src", "tests", "checks"]
