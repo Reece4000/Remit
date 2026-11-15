@@ -70,6 +70,7 @@ class Party(Document):
         ),
     )
     unique = ("code",)
+    searchable = ("code", "name")
 
     code: Code
     kind: PartyKind
@@ -93,6 +94,7 @@ class Contact(Document):
     """Someone at a party, and how to reach them. Removed contacts keep their history."""
 
     lifecycle = _DETAIL
+    searchable = ("name", "email")
 
     party_id: PartyId
     name: Annotated[Name, Personal]
@@ -107,6 +109,7 @@ class Address(Document):
     """A party's postal address. Formats differ by country, so only the country is structured."""
 
     lifecycle = _DETAIL
+    searchable = ("lines",)
 
     party_id: PartyId
     label: Name

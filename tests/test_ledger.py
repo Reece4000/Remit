@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from conftest import ROOT, every, rows
 
 from remit import ledger
 from remit.kernel import (
@@ -52,7 +53,7 @@ class Books:
         return self.kernel.execute(command, actor=BOOKKEEPER).result
 
     def balance(self, account: ledger.Account) -> ledger.Balance:
-        return ledger.balance(self.kernel, account.id)
+        return self.kernel.ask(ledger.AccountBalance(account_id=account.id), actor=ROOT)
 
 
 @pytest.fixture
@@ -78,7 +79,8 @@ def test_a_foreign_invoice_settles_with_an_exchange_difference(books: Books) -> 
     assert books.balance(books.bank).base == gbp("780")
     assert books.balance(books.sales).base == gbp("-800")
     assert books.balance(books.fx).base == gbp("20")
-    assert Money.total(ledger.trial_balance(books.kernel).values(), "GBP").is_zero
+    assert Money.total(books.kernel.ask(ledger.TrialBalance(), actor=ROOT).values(), "GBP").is_zero
+    assert books.kernel.settings(ledger.LedgerSettings).base_currency == "GBP"
 
 
 def test_a_foreign_balance_can_be_revalued_without_moving_the_foreign_amount(
@@ -107,14 +109,16 @@ def test_an_entry_with_several_legs_lands_on_every_account(books: Books) -> None
     assert books.balance(books.bank).base == gbp("120")
     assert books.balance(books.sales).base == gbp("-100")
     assert books.balance(vat).base == gbp("-20")
-    assert ledger.reconcile(books.kernel) == []
+    assert books.kernel.ask(ledger.Reconcile(), actor=ROOT) == []
 
 
 def test_balances_can_be_read_as_of_a_date(books: Books) -> None:
     books.post(JAN, debit(books.bank, gbp("100")), credit(books.sales, gbp("100")))
     books.post(FEB, debit(books.bank, gbp("50")), credit(books.sales, gbp("50")))
 
-    assert ledger.balance(books.kernel, books.bank.id, as_of=JAN).base == gbp("100")
+    assert books.kernel.ask(
+        ledger.AccountBalance(account_id=books.bank.id, as_of=JAN), actor=ROOT
+    ).base == gbp("100")
     assert books.balance(books.bank).base == gbp("150")
 
 
@@ -151,7 +155,7 @@ def test_balances_can_be_read_as_of_a_date(books: Books) -> None:
 def test_invalid_entries_are_refused_with_a_reason(books: Books, postings, reason: str) -> None:
     with pytest.raises(Rejected, match=reason):
         books.post(JAN, *postings(books))
-    assert books.kernel.find(ledger.JournalEntry) == []
+    assert every(books.kernel, ledger.JournalEntry) == []
 
 
 def test_a_reversal_cancels_an_entry_exactly_once(books: Books) -> None:
@@ -162,7 +166,7 @@ def test_a_reversal_cancels_an_entry_exactly_once(books: Books) -> None:
 
     assert reversal.reverses == entry.id
     assert books.balance(books.bank).is_zero
-    assert books.kernel.get(ledger.JournalEntry, entry.id) == entry
+    assert books.kernel.get(ledger.JournalEntry, entry.id, actor=ROOT) == entry
     with pytest.raises(Rejected, match="already been reversed"):
         books.kernel.execute(reverse, actor=BOOKKEEPER)
     with pytest.raises(Rejected, match="itself a reversal"):
@@ -199,9 +203,9 @@ def test_a_dry_run_shows_the_entry_and_posts_nothing(books: Books) -> None:
     outcome = books.kernel.execute(command, actor=BOOKKEEPER, dry_run=True)
 
     assert outcome.result.postings == postings
-    assert books.kernel.find(ledger.JournalEntry) == []
+    assert every(books.kernel, ledger.JournalEntry) == []
     assert books.balance(books.bank).is_zero
-    assert books.kernel.sql("SELECT count(*) FROM pgledger_transfers") == [(0,)]
+    assert rows("SELECT count(*) FROM pgledger_transfers") == [(0,)]
 
 
 def test_the_books_hold_a_clearing_balance_for_each_foreign_currency(books: Books) -> None:
@@ -211,14 +215,14 @@ def test_the_books_hold_a_clearing_balance_for_each_foreign_currency(books: Book
         credit(books.sales, gbp("800")),
     )
 
-    held = dict(books.kernel.sql("SELECT name, balance FROM pgledger_accounts_view"))
+    held = dict(rows("SELECT name, balance FROM pgledger_accounts_view"))
     assert held == {
         "1100:GBP": Decimal("800.00"),
         "4000:GBP": Decimal("-800.00"),
         "1100:USD": Decimal("1000.00"),
         "clearing:USD": Decimal("-1000.00"),
     }
-    assert ledger.reconcile(books.kernel) == []
+    assert books.kernel.ask(ledger.Reconcile(), actor=ROOT) == []
 
 
 def test_the_ledger_will_not_start_on_a_store_without_sql() -> None:

@@ -5,7 +5,7 @@ purchasing record what they need about an item in their own documents, referring
 the item by id, and declare `requires=(items.module,)`.
 """
 
-from .commands import AddItem, AmendItem, DiscontinueItem, ReinstateItem, item
+from .commands import AddItem, AmendItem, DiscontinueItem, ReinstateItem
 from .model import (
     Item,
     ItemAdded,
@@ -29,6 +29,5 @@ __all__ = [
     "ItemKind",
     "ItemReinstated",
     "ReinstateItem",
-    "item",
     "module",
 ]

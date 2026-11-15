@@ -56,7 +56,7 @@ source = ["remit"]
 
 [tool.coverage.report]
 # A floor, not a target: raise it as gaps are closed, never lower it.
-fail_under = 98.1
+fail_under = 98.6
 precision = 1
 show_missing = true
 skip_covered = true

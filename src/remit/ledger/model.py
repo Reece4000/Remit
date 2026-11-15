@@ -76,6 +76,7 @@ class Account(Document):
         transitions=(Transition("archive", source="active", target="archived"),),
     )
     unique = ("code",)
+    searchable = ("code", "name")
 
     code: Code
     name: Name
@@ -101,6 +102,7 @@ class JournalEntry(Document):
     """A balanced set of postings. Final from the moment it exists; corrected by reversal."""
 
     lifecycle = Lifecycle(initial="posted")
+    searchable = ("description",)
 
     posting_date: date
     description: str

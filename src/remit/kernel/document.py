@@ -58,6 +58,12 @@ class Document(BaseModel):
     The kernel refuses a write that would duplicate one, and on PostgreSQL a unique index
     makes the database refuse it too.
     """
+    searchable: ClassVar[tuple[str, ...]] = ()
+    """Text fields a listing's `search` looks in, such as a code and a name.
+
+    A search finds the documents whose searchable text holds every word of it, whatever
+    the case or accents. See `remit.kernel.search`.
+    """
 
     id: UUID = Field(default_factory=uuid7)
     """Identifies the document to the system, for good."""

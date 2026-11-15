@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid7
 
 import pytest
-from conftest import kernel_on
+from conftest import ROOT, every, kernel_on
 from pydantic import BaseModel, ValidationError
 
 from remit.kernel import (
@@ -174,8 +174,8 @@ def test_a_command_commits_its_documents_and_audit_entry(kernel: Kernel) -> None
 
     assert outcome.committed
     assert outcome.result.state == "open"
-    assert kernel.get(Ticket, outcome.result.id) == outcome.result
-    [entry] = kernel.audit()
+    assert kernel.get(Ticket, outcome.result.id, actor=ROOT) == outcome.result
+    [entry] = kernel.audit(actor=ROOT)
     assert (entry.actor, entry.action, entry.input) == (
         AGENT,
         "desk.open_ticket",
@@ -187,7 +187,7 @@ def test_a_command_commits_its_documents_and_audit_entry(kernel: Kernel) -> None
 def test_an_actor_without_the_permission_is_refused(kernel: Kernel, ticket: Ticket) -> None:
     with pytest.raises(Unauthorised):
         kernel.execute(RenameTicket(ticket_id=ticket.id, subject="Mine now"), actor=VISITOR)
-    assert kernel.get(Ticket, ticket.id) == ticket
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == ticket
 
 
 def test_find_sees_what_the_command_has_already_written(kernel: Kernel, ticket: Ticket) -> None:
@@ -210,7 +210,7 @@ def test_a_change_made_from_an_out_of_date_copy_is_refused(kernel: Kernel, ticke
         kernel.execute(
             RenameTicket(ticket_id=ticket.id, subject="Fax", version=ticket.version), actor=AGENT
         )
-    assert kernel.get(Ticket, ticket.id) == renamed
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == renamed
 
 
 def test_a_transition_waits_for_its_required_fields(kernel: Kernel, ticket: Ticket) -> None:
@@ -235,21 +235,21 @@ def test_a_document_in_a_final_state_never_changes(kernel: Kernel, ticket: Ticke
         kernel.execute(
             MoveTicket(ticket_id=ticket.id, transition=transition, resolution="Done"), actor=AGENT
         )
-    closed = kernel.get(Ticket, ticket.id)
+    closed = kernel.get(Ticket, ticket.id, actor=ROOT)
 
     with pytest.raises(Rejected, match="can no longer change"):
         kernel.execute(RenameTicket(ticket_id=ticket.id, subject="Again"), actor=AGENT)
     with pytest.raises(Rejected, match="this state is final"):
         kernel.execute(MoveTicket(ticket_id=ticket.id, transition="reopen"), actor=AGENT)
-    assert kernel.get(Ticket, ticket.id) == closed
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == closed
 
 
 def test_a_refused_command_leaves_nothing_behind(kernel: Kernel) -> None:
     with pytest.raises(Rejected):
         kernel.execute(OpenThenFail(subject="Ghost"), actor=AGENT)
 
-    assert kernel.find(Ticket) == []
-    assert kernel.audit() == []
+    assert every(kernel, Ticket) == []
+    assert kernel.audit(actor=ROOT) == []
 
 
 def test_a_dry_run_reports_what_would_happen_and_changes_nothing(
@@ -261,8 +261,8 @@ def test_a_dry_run_reports_what_would_happen_and_changes_nothing(
     assert not outcome.committed
     assert outcome.result.state == "resolved"
     assert outcome.events == (TicketResolved(ticket_id=ticket.id),)
-    assert kernel.get(Ticket, ticket.id) == ticket
-    assert kernel.events() == []
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == ticket
+    assert kernel.events(actor=ROOT) == []
 
 
 def test_an_idempotency_key_makes_a_retry_safe(kernel: Kernel) -> None:
@@ -275,7 +275,7 @@ def test_an_idempotency_key_makes_a_retry_safe(kernel: Kernel) -> None:
         first.documents,
         first.events,
     )
-    assert len(kernel.find(Ticket)) == 1
+    assert len(every(kernel, Ticket)) == 1
     with pytest.raises(Rejected, match="already used"):
         kernel.execute(OpenTicket(subject="Scanner"), actor=AGENT, idempotency_key="k1")
 
@@ -287,9 +287,9 @@ def test_a_subscription_receives_each_event_once(kernel: Kernel, ticket: Ticket)
 
     assert kernel.dispatch().delivered == 1
     assert kernel.dispatch().delivered == 0
-    [notice] = kernel.find(Notice)
+    [notice] = every(kernel, Notice)
     assert notice.ticket_id == ticket.id
-    delivery = kernel.audit()[-1]
+    delivery = kernel.audit(actor=ROOT)[-1]
     assert (delivery.actor.id, delivery.action, delivery.cause) == (
         "system:desk",
         "desk.notify_requester",
@@ -300,7 +300,7 @@ def test_a_subscription_receives_each_event_once(kernel: Kernel, ticket: Ticket)
 def test_writing_from_a_stale_copy_is_refused(kernel: Kernel, ticket: Ticket) -> None:
     with pytest.raises(RemitError, match="use the copy that change returned"):
         kernel.execute(WriteFromStaleCopy(ticket_id=ticket.id), actor=AGENT)
-    assert kernel.get(Ticket, ticket.id) == ticket
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == ticket
 
 
 def test_the_registry_describes_everything_a_module_declares(kernel: Kernel) -> None:
@@ -420,7 +420,7 @@ def test_a_unique_value_cannot_be_used_twice(routes: Kernel) -> None:
     )
     with pytest.raises(Rejected, match=r"routing\.queue email 'it@example\.com' is already in use"):
         routes.execute(CreateQueue(code="HR", email="it@example.com"), actor=ROUTER)
-    assert len(routes.find(Queue)) == 1
+    assert len(every(routes, Queue)) == 1
 
 
 def test_a_document_may_keep_its_own_unique_value_but_not_take_another(routes: Kernel) -> None:
@@ -438,7 +438,7 @@ def test_a_document_may_keep_its_own_unique_value_but_not_take_another(routes: K
 def test_unset_unique_values_do_not_collide(routes: Kernel) -> None:
     routes.execute(CreateQueue(code="IT"), actor=ROUTER)
     routes.execute(CreateQueue(code="HR"), actor=ROUTER)
-    assert len(routes.find(Queue, email=None)) == 2
+    assert len(every(routes, Queue, email=None)) == 2
 
 
 # A module writes only its own documents and emits only its own events. Another module
@@ -500,13 +500,13 @@ def test_a_module_cannot_write_another_modules_documents(bot: Kernel) -> None:
 
     with pytest.raises(RemitError, match=r"helpdesk_bot cannot write desk\.ticket"):
         bot.execute(Hijack(ticket_id=ticket.id), actor=BOT)
-    assert bot.get(Ticket, ticket.id) == ticket
+    assert bot.get(Ticket, ticket.id, actor=ROOT) == ticket
 
 
 def test_a_module_cannot_emit_another_modules_events(bot: Kernel) -> None:
     with pytest.raises(RemitError, match=r"helpdesk_bot cannot emit desk\.ticket_resolved"):
         bot.execute(FakeResolution(ticket_id=uuid7()), actor=BOT)
-    assert bot.events() == []
+    assert bot.events(actor=ROOT) == []
 
 
 def test_a_module_changes_another_modules_documents_through_its_commands(bot: Kernel) -> None:
@@ -514,7 +514,7 @@ def test_a_module_changes_another_modules_documents_through_its_commands(bot: Ke
 
     renamed = bot.execute(RenameThroughDesk(ticket_id=ticket.id), actor=BOT).result
 
-    assert bot.get(Ticket, ticket.id) == renamed
+    assert bot.get(Ticket, ticket.id, actor=ROOT) == renamed
     assert renamed.subject == "Via desk"
 
 
@@ -527,8 +527,8 @@ def test_a_subscription_cannot_write_another_modules_documents(bot: Kernel) -> N
     [failure] = dispatched.failures
     assert failure.subscription == "helpdesk_bot.close_resolved"
     assert "cannot write desk.ticket" in failure.error
-    assert bot.get(Ticket, ticket.id).state == "resolved"
-    assert len(bot.find(Notice)) == 1, "desk's own subscription is still delivered"
+    assert bot.get(Ticket, ticket.id, actor=ROOT).state == "resolved"
+    assert len(every(bot, Notice)) == 1, "desk's own subscription is still delivered"
 
 
 def test_a_module_cannot_execute_commands_of_a_module_it_does_not_require(store: Store) -> None:
@@ -542,7 +542,7 @@ def test_a_module_cannot_execute_commands_of_a_module_it_does_not_require(store:
     kernel = kernel_on(store, [desk, outsider])
     with pytest.raises(RemitError, match=r"outsider cannot execute desk\.open_ticket"):
         kernel.execute(OpenElsewhere(), actor=BOT)
-    assert kernel.find(Ticket) == []
+    assert every(kernel, Ticket) == []
 
 
 # One failing subscription must not hold up any other.
@@ -593,12 +593,12 @@ def test_a_failing_subscription_does_not_stop_the_others(triaged: Kernel, ticket
         ]
         assert dispatched.failures[0].error == "KeyError: 'missing'"
         assert dispatched.failures[1].error == "triage is closed"
-    assert len(triaged.find(Notice)) == 1, "desk's subscription ran despite triage's"
-    assert triaged.find(Tally) == []
+    assert len(every(triaged, Notice)) == 1, "desk's subscription ran despite triage's"
+    assert every(triaged, Tally) == []
 
     broken["triage.tally"] = False
     assert triaged.dispatch().delivered == 1
-    assert [tally.ticket_id for tally in triaged.find(Tally)] == [ticket.id]
+    assert [tally.ticket_id for tally in every(triaged, Tally)] == [ticket.id]
 
 
 # Subscription names: each keeps its place in the log under its name.
@@ -694,22 +694,22 @@ def test_idempotency_keys_of_different_actors_never_collide(kernel: Kernel) -> N
 
     assert not second.replayed
     assert first.result.id != second.result.id
-    assert len(kernel.find(Ticket)) == 2
+    assert len(every(kernel, Ticket)) == 2
 
 
 # What a store keeps must be the same whichever store it is.
 
 
 def test_finding_by_a_field_that_does_not_exist_is_refused(kernel: Kernel, ticket: Ticket) -> None:
-    with pytest.raises(RemitError, match=r"cannot find desk\.ticket by subjcet"):
-        kernel.find(Ticket, subjcet="Printer")
+    with pytest.raises(Rejected, match=r"cannot list desk\.ticket: where\.subjcet: it has no"):
+        every(kernel, Ticket, subjcet="Printer")
 
 
 def test_text_no_store_can_keep_is_refused_by_every_store(kernel: Kernel) -> None:
     with pytest.raises(Rejected, match=r"desk\.open_ticket: input\.subject contains U\+0000"):
         kernel.execute(OpenTicket(subject="Prin\x00ter"), actor=AGENT)
-    assert kernel.find(Ticket) == []
-    assert kernel.audit() == []
+    assert every(kernel, Ticket) == []
+    assert kernel.audit(actor=ROOT) == []
 
 
 class OpenWithId(Command[Ticket]):
@@ -727,7 +727,7 @@ def test_creating_a_document_whose_id_is_taken_is_refused_at_once(
 ) -> None:
     with pytest.raises(Rejected, match=f"there is already a desk.ticket with id {ticket.id}"):
         kernel.execute(OpenWithId(ticket_id=ticket.id), actor=AGENT)
-    assert kernel.get(Ticket, ticket.id) == ticket
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == ticket
 
 
 class Blank(Command[Ticket]):
@@ -751,7 +751,7 @@ def test_a_change_that_does_not_validate_is_rejected(kernel: Kernel, ticket: Tic
     )
     with pytest.raises(RemitError, match=r"desk\.ticket has no fields priority"):
         kernel.execute(Blank(ticket_id=ticket.id, field="priority"), actor=AGENT)
-    assert kernel.get(Ticket, ticket.id) == ticket
+    assert kernel.get(Ticket, ticket.id, actor=ROOT) == ticket
 
 
 # The store's own guards, which the kernel's checks normally keep from ever being reached.
@@ -774,7 +774,7 @@ def test_a_store_refuses_a_write_from_an_out_of_date_version(
 
     with pytest.raises(ConcurrencyError), kernel.store.unit() as unit:
         unit.commit(stored_as(kernel, ticket, version=2))
-    assert kernel.get(Ticket, ticket.id).subject == "Scanner"
+    assert kernel.get(Ticket, ticket.id, actor=ROOT).subject == "Scanner"
 
 
 def test_a_store_refuses_to_change_a_final_document(kernel: Kernel, ticket: Ticket) -> None:
@@ -783,7 +783,7 @@ def test_a_store_refuses_to_change_a_final_document(kernel: Kernel, ticket: Tick
 
     with pytest.raises(Rejected, match="final"), kernel.store.unit() as unit:
         unit.commit(stored_as(kernel, ticket, version=3))
-    assert kernel.get(Ticket, ticket.id).version == 2
+    assert kernel.get(Ticket, ticket.id, actor=ROOT).version == 2
 
 
 def test_a_store_refuses_an_idempotency_key_claimed_since_it_was_read(kernel: Kernel) -> None:

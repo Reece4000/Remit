@@ -3,7 +3,8 @@
 Install it with `Kernel([ledger.module], settings=[ledger.LedgerSettings(...)])` on a
 PostgreSQL store. Other modules post to it by executing `PostJournalEntry` from their
 own handlers, which puts the posting in the same unit of work as the document that
-caused it.
+caused it, and read it by asking its queries: `AccountBalance`, `TrialBalance`,
+`ClosedThrough` and `Reconcile`.
 """
 
 from .commands import (
@@ -30,17 +31,19 @@ from .model import (
     debit,
     module,
 )
-from .queries import Balance, balance, closed_through, reconcile, trial_balance
+from .queries import AccountBalance, Balance, ClosedThrough, Reconcile, TrialBalance
 
 __all__ = [
     "Account",
     "AccountArchived",
+    "AccountBalance",
     "AccountId",
     "AccountOpened",
     "AccountType",
     "ArchiveAccount",
     "Balance",
     "ClosePeriod",
+    "ClosedThrough",
     "JournalEntry",
     "JournalEntryId",
     "JournalEntryPosted",
@@ -50,12 +53,10 @@ __all__ = [
     "PeriodClosed",
     "PostJournalEntry",
     "Posting",
+    "Reconcile",
     "ReverseJournalEntry",
-    "balance",
-    "closed_through",
+    "TrialBalance",
     "credit",
     "debit",
     "module",
-    "reconcile",
-    "trial_balance",
 ]

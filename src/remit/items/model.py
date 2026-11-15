@@ -52,6 +52,7 @@ class Item(Document):
         ),
     )
     unique = ("code",)
+    searchable = ("code", "name", "description")
 
     code: Code
     kind: ItemKind

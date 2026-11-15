@@ -8,19 +8,23 @@ snapshot no writer can invalidate, so it is never aborted and never aborts a wri
 
 import hashlib
 import json
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from contextlib import contextmanager
 from importlib.resources import files
-from typing import Any, LiteralString, cast
+from typing import Any, cast
 from uuid import UUID
 
 from psycopg import Connection, Cursor, IsolationLevel, errors, sql
+from psycopg.abc import QueryNoTemplate
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .actor import Actor
 from .errors import ConcurrencyError, RegistrationError, Rejected, RemitError
 from .module import Migration, Module, installation_order
+from .search import VERSION as SEARCH_VERSION
+from .search import holding_pattern, ranked_patterns, searched
+from .selection import Comparison, Condition, Selection, comparable
 from .store import AuditEntry, Commit, Json, StoredEvent, Unit
 
 _SQL = files(__package__).joinpath("sql")
@@ -34,6 +38,7 @@ _KERNEL_MIGRATIONS = (
     Migration(
         "0002-idempotency-per-actor", _SQL.joinpath("0002-idempotency-per-actor.sql").read_text()
     ),
+    Migration("0003-search", _SQL.joinpath("0003-search.sql").read_text()),
 )
 _KERNEL_RULES = _SQL.joinpath("rules.sql").read_text()
 
@@ -67,6 +72,9 @@ class PostgresStore:
     def install(self, modules: Iterable[Module] = ()) -> None:
         """Install the kernel's tables, then each module's migrations, indexes and rules.
 
+        What listings search is rebuilt for every module whose definition differs from
+        the one last installed, so it always holds what the module now declares.
+
         Modules are installed with everything they require, dependencies first. Each
         migration is applied once and recorded with a digest; one that has changed since
         it was applied is refused, since applying it again is not possible and skipping
@@ -80,10 +88,16 @@ class PostgresStore:
             connection.execute("SELECT pg_advisory_xact_lock(%s)", (_INSTALL_LOCK,))
             connection.execute(_SQL.joinpath("bootstrap.sql").read_bytes())
             _apply(connection, _KERNEL, _KERNEL_MIGRATIONS, _KERNEL_RULES)
+            installed = dict(
+                connection.execute("SELECT module, fingerprint FROM installed_modules").fetchall()
+            )
+            refolded = installed.get(_KERNEL) != _kernel_fingerprint()
             _record(connection, _KERNEL, _kernel_fingerprint())
             for module in installation_order(modules):
                 _install_unique_indexes(connection, module)
                 _apply(connection, module.name, module.migrations, module.sql)
+                if refolded or installed.get(module.name) != fingerprint(module):
+                    _index_for_search(connection, module)
                 _record(connection, module.name, fingerprint(module))
 
     def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
@@ -131,13 +145,20 @@ def fingerprint(module: Module) -> str:
             "migrations": [(migration.name, migration.sql) for migration in module.migrations],
             "sql": module.sql,
             "unique": sorted(_unique_indexes(module)),
+            "searchable": {
+                kind: document.searchable for kind, document in module.documents.items()
+            },
         }
     )
 
 
 def _kernel_fingerprint() -> str:
     return _digest(
-        {"migrations": [(m.name, m.sql) for m in _KERNEL_MIGRATIONS], "sql": _KERNEL_RULES}
+        {
+            "migrations": [(m.name, m.sql) for m in _KERNEL_MIGRATIONS],
+            "sql": _KERNEL_RULES,
+            "search": SEARCH_VERSION,
+        }
     )
 
 
@@ -223,6 +244,24 @@ def _install_unique_indexes(connection: Connection[Any], module: Module) -> None
         )
 
 
+def _index_for_search(connection: Connection[Any], module: Module) -> None:
+    """Rebuild what listings search for a module's documents, from the documents themselves."""
+    connection.execute(
+        "DELETE FROM document_search WHERE kind = ANY(%s)", (list(module.documents),)
+    )
+    for kind, document in module.documents.items():
+        if not document.searchable:
+            continue
+        # A named cursor reads from the server a batch at a time, however many there are.
+        with connection.cursor(name="remit_search") as stored, connection.cursor() as index:
+            stored.execute("SELECT id, body FROM documents WHERE kind = %s", (kind,))
+            while batch := stored.fetchmany(1000):
+                index.executemany(
+                    "INSERT INTO document_search (kind, id, text) VALUES (%s, %s, %s)",
+                    [(kind, id, searched(body, document.searchable)) for id, body in batch],
+                )
+
+
 def _serialisable(connection: Connection[Any]) -> None:
     connection.isolation_level = IsolationLevel.SERIALIZABLE
 
@@ -250,9 +289,7 @@ class _PostgresUnit:
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
 
-    def _execute(
-        self, query: LiteralString | bytes, parameters: Sequence[object] = ()
-    ) -> Cursor[Any]:
+    def _execute(self, query: QueryNoTemplate, parameters: Sequence[object] = ()) -> Cursor[Any]:
         # Translated here as well as when the unit ends, so that a handler running SQL
         # sees a conflict as the `ConcurrencyError` it is.
         with _translated():
@@ -264,11 +301,8 @@ class _PostgresUnit:
         ).fetchone()
         return cast(Json, row[0]) if row else None
 
-    def find(self, kind: str, equals: Mapping[str, object]) -> list[Json]:
-        rows = self._execute(
-            "SELECT body FROM documents WHERE kind = %s AND body @> %s ORDER BY id",
-            (kind, Jsonb(dict(equals))),
-        ).fetchall()
+    def select(self, selection: Selection) -> list[Json]:
+        rows = self._execute(*_statement(selection)).fetchall()
         return [cast(Json, row[0]) for row in rows]
 
     def events(
@@ -340,14 +374,22 @@ class _PostgresUnit:
                     "VALUES (%s, %s, %s, %s, %s)",
                     (*values, *key),
                 )
-                continue
-            updated = execute(
-                "UPDATE documents SET version = %s, final = %s, body = %s "
-                "WHERE kind = %s AND id = %s AND version = %s",
-                (*values, *key, document.version - 1),
-            )
-            if updated.rowcount != 1:
-                raise ConcurrencyError(f"{document.kind} {document.id} changed since it was read")
+            else:
+                updated = execute(
+                    "UPDATE documents SET version = %s, final = %s, body = %s "
+                    "WHERE kind = %s AND id = %s AND version = %s",
+                    (*values, *key, document.version - 1),
+                )
+                if updated.rowcount != 1:
+                    raise ConcurrencyError(
+                        f"{document.kind} {document.id} changed since it was read"
+                    )
+            if document.search is not None:
+                execute(
+                    "INSERT INTO document_search (kind, id, text) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (kind, id) DO UPDATE SET text = EXCLUDED.text",
+                    (*key, document.search),
+                )
 
         audit = commit.audit
         if commit.events:
@@ -398,3 +440,134 @@ class _PostgresUnit:
                 "INSERT INTO idempotency (actor, key, record) VALUES (%s, %s, %s)",
                 (actor, key, Jsonb(record)),
             )
+
+
+_CASTS = {
+    Comparison.TEXT: sql.SQL(' COLLATE "C"'),
+    Comparison.NUMBER: sql.SQL("::numeric"),
+    Comparison.INSTANT: sql.SQL("::timestamptz"),
+}
+_RANGES = {"gt": sql.SQL(">"), "gte": sql.SQL(">="), "lt": sql.SQL("<"), "lte": sql.SQL("<=")}
+
+
+class _Statement:
+    """SQL being put together, with the parameters it has used so far, in order."""
+
+    def __init__(self) -> None:
+        self.parameters: list[object] = []
+
+    def bound(self, value: object) -> sql.Composable:
+        """A placeholder for a value. Values are always bound, never written into the SQL."""
+        self.parameters.append(value)
+        return sql.Placeholder()
+
+    def value(self, field: str, comparison: Comparison) -> sql.Composable:
+        """A document's field, as something that compares the way the field does."""
+        return sql.SQL("(d.body ->> {})").format(self.bound(field)) + _CASTS[comparison]
+
+    def given(self, value: Any, comparison: Comparison) -> sql.Composable:
+        """A stored value to compare a field with, bound as the type the field is cast to."""
+        return self.bound(comparable(value, comparison))
+
+    def holding(self, field: str, value: Any) -> sql.Composable:
+        """True for documents that hold exactly this JSON value in the field."""
+        return sql.SQL("d.body @> {}").format(self.bound(Jsonb({field: value})))
+
+    def same(self, field: str, value: Any, comparison: Comparison | None) -> sql.Composable:
+        if value is None or comparison is None or comparison is Comparison.TEXT:
+            return self.holding(field, value)
+        # Numbers and instants are equal by value, however each was written down. A field
+        # holding null is unequal to any value, not unknown, so that `ne` finds it.
+        return sql.SQL("{} IS NOT DISTINCT FROM {}").format(
+            self.value(field, comparison), self.given(value, comparison)
+        )
+
+    def condition(self, condition: Condition) -> sql.Composable:
+        field, comparison = condition.field, condition.comparison
+        if condition.operator == "in":
+            if not condition.value:
+                return sql.SQL("false")
+            options = [self.same(field, value, comparison) for value in condition.value]
+            return sql.SQL("({})").format(sql.SQL(" OR ").join(options))
+        if condition.operator == "eq":
+            return self.same(field, condition.value, comparison)
+        if condition.operator == "ne":
+            return sql.SQL("NOT ({})").format(self.same(field, condition.value, comparison))
+        # `select` offers the range operators only on fields whose values have an order.
+        ordered = cast(Comparison, comparison)
+        return sql.SQL("{} {} {}").format(
+            self.value(field, ordered),
+            _RANGES[condition.operator],
+            self.given(condition.value, ordered),
+        )
+
+
+def _statement(selection: Selection) -> tuple[sql.Composed, list[object]]:
+    """A selection as SQL that means what `Selection.arranged` means.
+
+    The inner query finds the documents and works out what each is ordered by; the outer
+    one starts after the place the last page ended, orders them and cuts the page.
+    """
+    statement = _Statement()
+    source = sql.SQL("documents AS d")
+    conditions: list[sql.Composable] = []
+    searching = bool(selection.terms)
+    if searching:
+        source += sql.SQL(" JOIN document_search AS s ON s.kind = d.kind AND s.id = d.id")
+
+    if selection.ranked:
+        exact, starting = ranked_patterns(selection.terms)
+        leading: sql.Composable | None = sql.SQL(
+            "CASE WHEN s.text LIKE {} THEN 0 WHEN s.text LIKE {} THEN 1 ELSE 2 END"
+        ).format(statement.bound(exact), statement.bound(starting))
+    elif selection.order == "id":
+        leading = None
+    else:
+        leading = statement.value(selection.order, selection.comparison)
+
+    conditions.append(sql.SQL("d.kind = {}").format(statement.bound(selection.kind)))
+    conditions += [statement.condition(condition) for condition in selection.where]
+    conditions += [
+        sql.SQL("s.text LIKE {}").format(statement.bound(holding_pattern(term)))
+        for term in selection.terms
+    ]
+    found = sql.SQL("SELECT d.body, d.id, {} AS ordered_by FROM {} WHERE {}").format(
+        leading or sql.SQL("NULL"), source, sql.SQL(" AND ").join(conditions)
+    )
+
+    # Nulls sort after every value, and a descending order is the ascending one reversed.
+    direction = sql.SQL("DESC NULLS FIRST" if selection.descending else "ASC NULLS LAST")
+    beyond = sql.SQL("<" if selection.descending else ">")
+    order = sql.SQL("id {}").format(direction)
+    if leading is not None:
+        order = sql.SQL("ordered_by {}, ").format(direction) + order
+
+    after = sql.SQL("true")
+    if selection.after is not None:
+        ended, id = selection.after
+        comparison = Comparison.NUMBER if selection.ranked else selection.comparison
+
+        def further() -> sql.Composable:
+            return sql.SQL("id {} {}").format(beyond, statement.bound(UUID(id)))
+
+        if leading is None:
+            after = further()
+        elif ended is None and selection.descending:
+            after = sql.SQL("(ordered_by IS NOT NULL OR {})").format(further())
+        elif ended is None:
+            after = sql.SQL("(ordered_by IS NULL AND {})").format(further())
+        else:
+            after = sql.SQL("(ordered_by {} {} OR (ordered_by = {} AND {}){})").format(
+                beyond,
+                statement.given(ended, comparison),
+                statement.given(ended, comparison),
+                further(),
+                sql.SQL("" if selection.descending else " OR ordered_by IS NULL"),
+            )
+
+    return (
+        sql.SQL("SELECT body FROM ({}) AS found WHERE {} ORDER BY {} LIMIT {}").format(
+            found, after, order, statement.bound(selection.limit)
+        ),
+        statement.parameters,
+    )

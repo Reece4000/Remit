@@ -3,6 +3,7 @@
 from uuid import uuid7
 
 import pytest
+from conftest import ROOT, every
 from pydantic import ValidationError
 
 from remit import parties
@@ -11,7 +12,6 @@ from remit.kernel import (
     Actor,
     ActorKind,
     Kernel,
-    NotFound,
     Rejected,
     Store,
     Unauthorised,
@@ -85,8 +85,8 @@ def test_a_party_is_registered_and_found_by_code_or_kind(kernel: Kernel) -> None
 
     registered = outcome.result
     assert (registered.state, registered.name) == ("active", "Harbour Cooperative")
-    assert parties.party(kernel, "C0001") == registered
-    assert kernel.find(Party, kind=PartyKind.ORGANISATION) == [registered]
+    assert every(kernel, Party, code="C0001") == [registered]
+    assert every(kernel, Party, kind=PartyKind.ORGANISATION) == [registered]
     assert outcome.events == (parties.PartyRegistered(party_id=registered.id, code="C0001"),)
 
 
@@ -96,7 +96,7 @@ def test_codes_are_never_shared_even_with_an_archived_party(kernel: Kernel) -> N
 
     with pytest.raises(Rejected, match="party code 'C0001' is already in use"):
         register(kernel, name="Another Cooperative")
-    assert len(kernel.find(Party)) == 1
+    assert len(every(kernel, Party)) == 1
 
 
 @pytest.mark.parametrize(
@@ -149,7 +149,7 @@ def test_an_amendment_from_an_out_of_date_copy_is_refused(kernel: Kernel) -> Non
 
     with pytest.raises(Rejected, match="has changed since version 1"):
         amend(kernel, party, tax_number="NL123456789B01")
-    assert parties.party(kernel, "C0001").tax_number is None
+    assert kernel.get(Party, party.id, actor=ROOT).tax_number is None
 
 
 def test_an_amendment_that_changes_nothing_is_refused(kernel: Kernel) -> None:
@@ -185,13 +185,15 @@ def test_contacts_and_addresses_are_kept_beside_the_party(kernel: Kernel) -> Non
     pieter = add_contact(kernel, party, "Pieter Bakker")
     delivery = add_address(kernel, party)
 
-    assert parties.contacts(kernel, party.id) == [sanne, pieter]
+    assert every(kernel, Contact, party_id=party.id, state="current") == [sanne, pieter]
     assert sanne.email == "Sanne@example.nl"
-    assert parties.addresses(kernel, party.id) == [delivery]
-    assert kernel.get(Party, party.id).version == 1, "adding details does not change the party"
+    assert every(kernel, parties.Address, party_id=party.id, state="current") == [delivery]
+    assert kernel.get(Party, party.id, actor=ROOT).version == 1, (
+        "adding details does not change the party"
+    )
 
     kernel.execute(RemoveContact(contact_id=pieter.id), actor=CLERK)
-    assert parties.contacts(kernel, party.id) == [sanne]
+    assert every(kernel, Contact, party_id=party.id, state="current") == [sanne]
 
 
 def test_two_contacts_can_be_amended_from_the_same_reading_of_the_party(kernel: Kernel) -> None:
@@ -210,7 +212,7 @@ def test_two_contacts_can_be_amended_from_the_same_reading_of_the_party(kernel: 
             ),
             actor=CLERK,
         )
-    assert [c.email for c in parties.contacts(kernel, party.id)] == [
+    assert [c.email for c in every(kernel, Contact, party_id=party.id, state="current")] == [
         "sanne@example.nl",
         "pieter@example.nl",
     ]
@@ -247,8 +249,10 @@ def test_erasing_a_contact_leaves_the_rest_of_the_party(kernel: Kernel) -> None:
         "Purchasing",
     )
     assert outcome.events == (parties.ContactErased(contact_id=sanne.id),)
-    assert parties.contacts(kernel, party.id) == [pieter]
-    added = [entry.input for entry in kernel.audit() if entry.action == "parties.add_contact"]
+    assert every(kernel, Contact, party_id=party.id, state="current") == [pieter]
+    added = [
+        entry.input for entry in kernel.audit(actor=ROOT) if entry.action == "parties.add_contact"
+    ]
     assert [entry["name"] for entry in added] == [ERASED, "Pieter Bakker"]
     with pytest.raises(Rejected, match="cannot erase from state 'erased'"):
         kernel.execute(EraseContact(contact_id=sanne.id), actor=CLERK)
@@ -267,9 +271,52 @@ def test_erasing_a_person_erases_their_contacts_and_addresses(kernel: Kernel) ->
         ERASED,
         None,
     )
-    assert [c.state for c in kernel.find(Contact, party_id=amy.id)] == ["erased"]
-    assert [a.lines for a in kernel.find(parties.Address, party_id=amy.id)] == [(ERASED,)]
-    kept = " ".join(str(entry.input) for entry in kernel.audit())
+    assert [c.state for c in every(kernel, Contact, party_id=amy.id)] == ["erased"]
+    assert [a.lines for a in every(kernel, parties.Address, party_id=amy.id)] == [(ERASED,)]
+
+
+def test_parties_and_their_details_are_found_by_what_people_remember(kernel: Kernel) -> None:
+    harbour = register(kernel, "C0001", name="Harbour Coöperative")
+    register(kernel, "C0002", name="Hollander & Zoon")
+    sanne = add_contact(kernel, harbour, email="sanne@harbour.example")
+    add_contact(kernel, harbour, "Pieter Bakker")
+    depot = add_address(kernel, harbour, "Kade 12", "3011 Rotterdam")
+
+    def found(kind: type[Party | Contact | parties.Address], search: str) -> tuple[object, ...]:
+        return kernel.page(kind, actor=CLERK, search=search).items
+
+    assert found(Party, "cooperative harb") == (harbour,)
+    assert [p.code for p in kernel.page(Party, actor=CLERK, search="c000").items] == [
+        "C0001",
+        "C0002",
+    ]
+    assert found(Contact, "VRIES") == (sanne,)
+    assert found(Contact, "harbour.example") == (sanne,)
+    assert found(parties.Address, "rotterdam kade") == (depot,)
+    current = {"party_id": harbour.id, "state": "current"}
+    assert [
+        c.name for c in kernel.page(Contact, actor=CLERK, where=current, order="name").items
+    ] == [
+        "Pieter Bakker",
+        "Sanne de Vries",
+    ]
+
+
+def test_an_erased_person_can_no_longer_be_searched_for(kernel: Kernel) -> None:
+    amy = register(kernel, "P0001", kind=PartyKind.PERSON, name="Amy Shaw")
+    add_contact(kernel, amy, "Amy Shaw", email="amy@example.com")
+    add_address(kernel, amy, "1 Mill Lane", "York", country="GB")
+    assert len(kernel.page(Party, actor=CLERK, search="shaw").items) == 1
+
+    kernel.execute(EraseParty(party_id=amy.id), actor=CLERK)
+
+    assert kernel.page(Party, actor=CLERK, search="shaw").items == ()
+    assert kernel.page(Contact, actor=CLERK, search="amy").items == ()
+    assert kernel.page(parties.Address, actor=CLERK, search="mill").items == ()
+    assert [party.code for party in kernel.page(Party, actor=CLERK, search="p0001").items] == [
+        "P0001"
+    ], "the code is not personal, and still finds the record"
+    kept = " ".join(str(entry.input) for entry in kernel.audit(actor=ROOT))
     for personal in ("Amy Shaw", "AB123456C", "amy@example.com", "Mill Lane"):
         assert personal not in kept
 
@@ -278,11 +325,6 @@ def test_an_organisation_is_not_a_person_to_erase(kernel: Kernel) -> None:
     party = register(kernel)
     with pytest.raises(Rejected, match="is an organisation, not a person; erase its contacts"):
         kernel.execute(EraseParty(party_id=party.id), actor=CLERK)
-
-
-def test_looking_up_a_code_that_does_not_exist_says_so(kernel: Kernel) -> None:
-    with pytest.raises(NotFound, match="no party with code 'C9999'"):
-        parties.party(kernel, "C9999")
 
 
 def test_registering_does_not_grant_amending(kernel: Kernel) -> None:
@@ -318,7 +360,7 @@ def test_addresses_are_amended_removed_and_erased_on_their_own(kernel: Kernel) -
     erased = kernel.execute(parties.EraseAddress(address_id=billing.id), actor=CLERK).result
 
     assert (erased.state, erased.lines, erased.country) == ("erased", (ERASED,), "NL")
-    assert parties.addresses(kernel, party.id) == [moved.result]
+    assert every(kernel, parties.Address, party_id=party.id, state="current") == [moved.result]
 
 
 def test_a_removed_contact_cannot_be_amended_but_can_be_erased(kernel: Kernel) -> None:

@@ -1,7 +1,8 @@
-"""Commands and events: the two kinds of message, and what becomes of them.
+"""Commands, queries and events: the kinds of message, and what becomes of them.
 
-A command asks for something to happen and may be refused. An event states that
-something did happen and cannot be. `Command[R]` names the type its handler returns.
+A command asks for something to happen and may be refused. A query asks what is so and
+changes nothing. An event states that something did happen and cannot be refused.
+`Command[R]` names the type its handler returns.
 """
 
 from dataclasses import dataclass
@@ -15,6 +16,12 @@ from .document import Document
 class Command[R](BaseModel):
     # Unknown fields are refused, not ignored: a caller who names a field that does not
     # exist (or cannot be changed) must be told, not left believing it took effect.
+    model_config = ConfigDict(frozen=True, extra="forbid", use_attribute_docstrings=True)
+
+
+class Query[R](BaseModel):
+    """Asks for something to be read. `Query[R]` names the type its handler returns."""
+
     model_config = ConfigDict(frozen=True, extra="forbid", use_attribute_docstrings=True)
 
 

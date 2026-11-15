@@ -6,7 +6,7 @@ from uuid import UUID
 
 import psycopg
 import pytest
-from conftest import DSN, kernel_on
+from conftest import DSN, every, kernel_on
 from psycopg.conninfo import make_conninfo
 from pydantic import BaseModel
 
@@ -117,7 +117,7 @@ def test_a_module_reacts_to_events_of_the_modules_it_requires(store: Store) -> N
     kernel = kernel_on(store, [shop])
     product = kernel.execute(ListProduct(name="Kettle"), actor=ADMIN).result
     assert kernel.dispatch().delivered == 1
-    assert [label.product_id for label in kernel.find(ShelfLabel)] == [product.id]
+    assert [label.product_id for label in every(kernel, ShelfLabel)] == [product.id]
 
 
 def test_a_module_cannot_react_to_events_of_a_module_it_does_not_require() -> None:

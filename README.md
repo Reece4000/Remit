@@ -27,6 +27,13 @@ entry in the audit trail.
   A document in a final state can never change again.
 - **People and agents are the same kind of actor.** Both hold permissions and both are
   refused in the same words, which an agent can read and act on.
+- **Reading is permitted the way changing is.** Every read names the actor who is
+  reading. `ledger.read.*` lets a role read the ledger and change nothing; `ledger.*`
+  grants both; `*.read.*` suits an auditor.
+- **Every kind of document can be listed, with nothing written for it.** One call
+  filters, searches, orders and pages any of them, and means the same on every store.
+  Reads that take code, such as a trial balance, are declared as queries, with a
+  docstring, a typed input and a typed result, exactly as commands are.
 - **Anything can be tried first.** A dry run executes a command for real and rolls it
   back, reporting what would have happened.
 - **Retries are safe.** A command an actor sends twice with the same idempotency key runs
@@ -183,12 +190,67 @@ kernel.execute(
     actor=bookkeeper,
 )
 
-held = ledger.balance(kernel, receivables.id)
+held = kernel.ask(ledger.AccountBalance(account_id=receivables.id), actor=bookkeeper)
 print(held.base, held.foreign["USD"])  # GBP 800.00 USD 1000.00
 ```
 
 Another module posts to the ledger by executing `PostJournalEntry` from its own handler,
 which puts the posting in the same transaction as the document that caused it.
+
+## Reading
+
+An actor who may read a kind of document can list it:
+
+```python
+auditor = Actor(id="agent:audit", kind=ActorKind.AGENT, permissions=frozenset({"*.read.*"}))
+
+page = kernel.page(
+    ledger.JournalEntry,
+    actor=auditor,
+    where={"posting_date": {"gte": "2026-01-01", "lt": "2026-02-01"}},
+    order="-posting_date",
+    limit=50,
+)
+following = kernel.page(..., after=page.next)  # the same listing, continued
+
+kernel.page(ledger.Account, actor=auditor, search="receiv")  # finds "Receivables (USD)"
+kernel.ask(ledger.TrialBalance(as_of=date(2026, 1, 31)), actor=auditor)
+```
+
+- **`where`** maps a field to the value it must equal, or to operators: `eq`, `ne`,
+  `in`, `gt`, `gte`, `lt`, `lte`. Values are checked against the field's type, so dates
+  compare as dates, amounts as numbers and times as instants, and a misspelt field is
+  refused instead of matching nothing. Every fault in a listing is reported at once,
+  each against the part at fault.
+- **`search`** looks in the fields a document declares `searchable`. It finds the
+  documents holding every word of the search, whatever the case, accents or width
+  (`muller` finds `Müller`), and puts exact matches first, then those that start with
+  the search. On PostgreSQL a trigram index (`pg_trgm`, which ships with it) makes that
+  fast. The index does not decide what matches: the kernel does, so tests on the
+  memory store predict production.
+- **`order`** names one field, `-` first for descending. Ties are broken by id, which
+  is also the order of creation.
+- **`after`** takes the previous page's `next`. Pages are reached by cursor, so
+  documents added between two pages are neither skipped nor repeated.
+
+A query is declared like a command, and its handler is given a reader, which has no
+means of writing:
+
+```python
+class Overdue(Query[tuple[Consignment, ...]]):
+    days: int = 7
+    """How long ago a consignment was packed before it counts as overdue."""
+
+
+@shipping.query
+def overdue(query: Overdue, reader: Reader) -> tuple[Consignment, ...]:
+    """Consignments packed some days ago and still not booked."""
+    ...
+```
+
+It is registered as `shipping.overdue`, asked with `kernel.ask(Overdue(), actor=...)`
+by an actor holding `shipping.read.overdue`, and asked by other modules' handlers with
+`context.ask(Overdue())`.
 
 ## What is guaranteed, and how it is checked
 
@@ -198,7 +260,11 @@ which puts the posting in the same transaction as the document that caused it.
 | Rules a handler checks still hold when it commits, whatever else is running | Serialisable transactions, retried on conflict | Threads racing for the same account code, reversal, period close and event |
 | The ledger always balances | The ledger's commands, a database trigger, and pgledger's two-sided transfers | Property tests over random command sequences, recomputing each balance independently |
 | Posted entries, the event log and the audit trail cannot be altered or emptied | Database triggers on rows and on TRUNCATE, as well as the kernel | Tests that write to the tables directly and expect refusal |
-| Nothing changes except through a command | Writes go only through the kernel's commit; reads run in read-only transactions | Updates and inserts sent through `Kernel.sql` |
+| Nothing changes except through a command | Writes go only through the kernel's commit; reads run in read-only transactions, and a query's handler is given no means of writing | Updates, inserts and deletes sent through a query; the reader a command's query is handed |
+| Nothing is read without permission to read it | Every read through the kernel names an actor and is checked; there is no unchecked read | Actors without the permission, for documents, queries, the audit trail and ids that do not exist |
+| A listing means the same on every store | One definition, in Python; PostgreSQL's SQL is held to it | Hundreds of random listings, paged through on both stores and compared |
+| Paging neither skips nor repeats documents as others are added | Cursors mark a place in the order, and continue only the listing that gave them | Documents added between pages; cursors forged, or taken to another listing |
+| Search reads only what the document now holds | What is searched is written with the document, and rebuilt on install when a module declares it differently | Searching for the erased; the search table read directly; reinstalls |
 | Nothing is posted into a closed period | The ledger's commands and a database trigger | Both of the above |
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
 | A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
@@ -212,8 +278,8 @@ which puts the posting in the same transaction as the document that caused it.
 | A migration, once applied, never changes | Each is recorded with a digest, and install refuses one that differs | Migrations edited after they were applied |
 | Every store refuses the same things | Shared field types refuse unprintable text, and every commit is checked for text PostgreSQL cannot store | The kernel's tests, run against both stores |
 
-`./check --deep` goes one step further: it breaks the framework in twenty-four ways, one
-at a time, and confirms the tests fail for each.
+`./check --deep` goes one step further: it breaks the framework in thirty ways, one at a
+time, and confirms the tests fail for each.
 
 Some things are trusted rather than checked, because modules are code you choose to
 install:
@@ -228,6 +294,24 @@ install:
   who may issue an invoice should not also need permission to post journal entries for
   the invoice to reach the ledger. Permissions are checked once, where an actor issues
   a command.
+- A handler reads on the authority of what it is handling, in the same way: an actor
+  who may ask for a trial balance need not also hold permission to read every account.
+  What a command or a query gives back is therefore up to the module that wrote it.
+
+And some things reading does not do yet:
+
+- Permission to read covers a whole kind of document. Limiting it to some documents
+  (a salesperson's own customers) or some fields (hiding personal data from an agent)
+  belongs with roles and limits, under Controls in the roadmap. Every read passes
+  through one check in the kernel, which is where those will go.
+- Reads are not recorded in the audit trail.
+- Text is ordered by code point, which every store agrees on and no upgrade can
+  change: capitals sort before lower case, and accented letters after `z`.
+- A listing ordered by anything but id is sorted by the database on each request, with
+  no index of its own. That suits kinds with hundreds of thousands of documents, not
+  hundreds of millions.
+- A listing does not count how many documents match.
+- Search does not forgive misspellings.
 
 ## Getting started
 
@@ -277,7 +361,8 @@ imports only `remit.kernel` and the top-level packages of the modules it require
 ## Roadmap
 
 1. **The outside surface.** A REST API and an MCP server, both generated from the
-   registry; a worker process for event dispatch; authentication; a container image.
+   registry; audit by document and a feed of changes; a worker process for event
+   dispatch; authentication; a container image.
 2. **Controls.** Roles, limits per role, approval steps and segregation of duties.
 3. **More kernel primitives.** Modules that add fields to, and refuse transitions of,
    documents they do not own; links between the lines of related

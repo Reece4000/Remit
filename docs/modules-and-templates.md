@@ -20,7 +20,7 @@ outside the kernel, so can any module a customer writes for themselves.
 
 ## Modules
 
-A module declares documents, events, commands and subscriptions (as now), plus:
+A module declares documents, events, commands, queries and subscriptions (as now), plus:
 
 - **Dependencies.** `Module("sales", requires=(parties.module, items.module, ledger.module))`.
   Dependencies are module objects, not names, so a module cannot be declared before
@@ -34,11 +34,13 @@ A module declares documents, events, commands and subscriptions (as now), plus:
   executes one of that module's commands, which it may do only for its own commands and
   those of modules it requires. So a custom module cannot get round a standard module's
   rules (the ledger's balance, a code that never changes) by writing its documents
-  directly. `context.sql` is not yet held to this; see the README.
-- **Stable names.** Documents, events and commands are named after their classes, and
-  subscriptions after their handlers, prefixed with the module's name. Stored documents,
-  permissions and each subscription's place in the event log are kept under those
-  names, so renaming one is a migration, not a refactor. A subscription can be given a
+  directly. `context.sql` is not yet held to this; see the README. It reads another
+  module's documents freely, and asks the queries of the modules it requires.
+- **Stable names.** Documents, events, commands and queries are named after their
+  classes, and subscriptions after their handlers, prefixed with the module's name.
+  Stored documents, permissions and each subscription's place in the event log are kept
+  under those names, so renaming one is a migration, not a refactor. The permission to
+  read a document or ask a query is `<module>.read.<name>`. A subscription can be given a
   fixed name, `@module.subscribe(Event, name="notify")`, so that its handler can be
   renamed freely.
 - **Extensions to other modules' documents.** A module can add fields to a document it

@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID, uuid7
 
 import pytest
-from conftest import kernel_on
+from conftest import ROOT, every, kernel_on
 from pydantic import BaseModel
 
 from remit import ledger, parties
@@ -99,7 +99,7 @@ def shelf(kernel: Kernel) -> UUID:
 
 def test_a_reference_may_lead_to_a_document_written_in_the_same_unit(kernel: Kernel) -> None:
     book = kernel.execute(OpenShelfWithBook(label="B", title="Second"), actor=LIBRARIAN).result
-    assert kernel.get(Shelf, book.shelf_id).label == "B"
+    assert kernel.get(Shelf, book.shelf_id, actor=ROOT).label == "B"
 
 
 def test_a_document_whose_reference_leads_nowhere_is_refused(kernel: Kernel) -> None:
@@ -111,7 +111,7 @@ def test_a_document_whose_reference_leads_nowhere_is_refused(kernel: Kernel) -> 
 
     message = f"there is no library.shelf with id {nowhere}"
     assert refused.value.problems == (Problem(("shelf_id",), message, "library.book"),)
-    assert kernel.find(Book, title="Lost") == []
+    assert every(kernel, Book, title="Lost") == []
 
 
 @pytest.mark.parametrize(
@@ -140,7 +140,7 @@ def test_references_are_followed_into_optional_fields_tuples_and_nested_models(
 
 
 def test_sound_references_of_every_shape_are_written(kernel: Kernel, shelf: UUID) -> None:
-    [first] = kernel.find(Book, title="First")
+    [first] = every(kernel, Book, title="First")
     command = ShelveBook(
         title="Second",
         shelf_id=shelf,

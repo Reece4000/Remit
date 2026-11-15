@@ -1,21 +1,28 @@
-"""The context: one unit of work, handed to every handler.
+"""The reader and the context: one unit of work, as handlers see it.
 
-Everything a handler reads, writes or emits goes through it. Reads come from the unit's
-transaction; writes are held here until the kernel commits them together, so a handler
-that raises leaves nothing behind.
+A query's handler is given a `Reader`, which reads documents and settings and has no
+way to change anything. A command's or subscription's handler is given a `Context`, a
+reader that also writes. Reads come from the unit's transaction; writes are held in the
+context until the kernel commits them together, so a handler that raises leaves nothing
+behind.
 
 A module reads any document but writes only its own, and emits only its own events. To
 change another module's documents it executes that module's commands, so the rules
 those commands enforce (a ledger's balance, a code that never changes) cannot be gone
 around. The context knows which module's code is running because it is told each time
-control passes from one module to another: when the kernel runs a command or a
-subscription, and when a handler executes another module's command.
+control passes from one module to another: when the kernel runs a command, a query or a
+subscription, and when a handler executes another module's command or asks its query.
+
+A handler reads on the authority of whatever it is handling. The kernel checks an
+actor's permission once, where the actor issues a command or asks to read; what the
+handler then reads in order to answer is not checked again.
 """
 
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
@@ -24,25 +31,20 @@ from .actor import Actor
 from .codec import Codec
 from .document import Document
 from .errors import NotFound, Problem, Rejected, RemitError, invalid
-from .message import Command, Event
+from .message import Command, Event, Query
+from .module import Module
 from .personal import carries_personal, unerased
 from .reference import references
 from .registry import Registry
-from .store import Unit
+from .selection import DEFAULT_LIMIT, Page, Selection, select
+from .store import Json, Unit
 
 _RESERVED = frozenset({"id", "state", "version"})
 
 
-class Reader(Protocol):
-    """Read access to documents and settings. The kernel and the context both provide it."""
+class Reader:
+    """Read access to one unit of work."""
 
-    def get[D: Document](self, kind: type[D], id: UUID) -> D: ...
-    def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]: ...
-    def settings[S: BaseModel](self, kind: type[S]) -> S: ...
-    def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]: ...
-
-
-class Context:
     def __init__(
         self,
         *,
@@ -61,35 +63,11 @@ class Context:
         self._settings = settings
         self._modules = [module]
         self._written: dict[tuple[type[Document], UUID], Document] = {}
-        self._read_versions: dict[tuple[type[Document], UUID], int] = {}
-        self._emitted: list[Event] = []
-        self._erasures: dict[UUID, type[Document]] = {}
 
     @property
     def module(self) -> str:
         """The module whose code is running now."""
         return self._modules[-1]
-
-    @property
-    def written(self) -> tuple[Document, ...]:
-        return tuple(self._written.values())
-
-    @property
-    def emitted(self) -> tuple[Event, ...]:
-        return tuple(self._emitted)
-
-    @property
-    def erasures(self) -> tuple[UUID, ...]:
-        return tuple(self._erasures)
-
-    def finish(self) -> None:
-        """Check what can only be checked once the handler has returned.
-
-        An erased document must hold no personal values when the unit commits, however
-        it was written after `erase` was called.
-        """
-        for id, kind in self._erasures.items():
-            self._require_erased(self._get(kind, id))
 
     def get[D: Document](self, kind: type[D], id: UUID, *, version: int | None = None) -> D:
         """A document by id. With `version`, refuse if it has changed since that version.
@@ -116,17 +94,52 @@ class Context:
         return self._codec.load(kind, body)
 
     def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]:
-        """Documents whose fields equal the given values, oldest first."""
-        filters = self._codec.filters(kind, equals)
-        stored = self._unit.find(self._registry.document_name(kind), filters)
-        found = {document.id: document for document in (self._codec.load(kind, b) for b in stored)}
-        for (written_kind, id), document in self._written.items():
-            if written_kind is kind:
-                if all(getattr(document, field) == value for field, value in equals.items()):
-                    found[id] = cast(D, document)
-                else:
-                    found.pop(id, None)
-        return list(found.values())
+        """Every document whose fields equal the given values, oldest first.
+
+        For the rules a handler checks, which must see all of them. To show documents
+        to someone, read a `page`.
+        """
+        selection = select(self._registry.document_name(kind), kind, where=equals)
+        return [self._codec.load(kind, body) for body in self._select(kind, selection)]
+
+    def page[D: Document](
+        self,
+        kind: type[D],
+        *,
+        where: Mapping[str, object] | None = None,
+        search: str | None = None,
+        order: str | None = None,
+        after: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+    ) -> Page[D]:
+        """One page of the documents of a kind, filtered, searched and ordered.
+
+        `where`, `search` and `order` are described in `remit.kernel.selection`. Pass
+        the page's `next` as `after` to read the page that follows it.
+        """
+        selection = select(
+            self._registry.document_name(kind),
+            kind,
+            where=where,
+            search=search,
+            order=order,
+            after=after,
+            limit=limit,
+        )
+        # One more than asked for, to learn whether another page follows.
+        found = self._select(kind, replace(selection, limit=limit + 1))
+        following = selection.cursor(found[limit - 1]) if len(found) > limit else None
+        return Page(tuple(self._codec.load(kind, body) for body in found[:limit]), following)
+
+    def ask[R](self, query: Query[R]) -> R:
+        """Ask a query inside this unit of work, on the authority of what is running.
+
+        The query may belong to this module or to one it requires.
+        """
+        spec = self._registry.query(type(query))
+        self._require_reach(self._registry.modules[spec.module], f"ask {spec.name}")
+        with self._running(spec.module):
+            return cast(R, spec.handler(query, self._reading()))
 
     def settings[S: BaseModel](self, kind: type[S]) -> S:
         return cast(S, self._settings[kind])
@@ -139,10 +152,97 @@ class Context:
         hold SQL to that: the statement runs with the kernel's own database rights, so
         it could change another module's tables, or the documents table itself, without
         an audit entry. The database refuses edits to final documents and to history
-        whatever runs them; giving each module a database role of its own, limited to
-        its tables, is the planned way to enforce the rest.
+        whatever runs them, and refuses every change made while reading; giving each
+        module a database role of its own, limited to its tables, is the planned way to
+        enforce the rest.
         """
         return self._unit.sql(query, parameters)
+
+    def _reading(self) -> Reader:
+        """What a query's handler is given: this unit of work, with no way to write to it."""
+        return self
+
+    def _select(self, kind: type[Document], selection: Selection) -> list[Json]:
+        """What the store selects, as it will stand once this unit's own writes commit."""
+        written = [document for (wrote, _), document in self._written.items() if wrote is kind]
+        if not written:
+            return self._unit.select(selection)
+        # Each write can displace at most one stored document from the page.
+        enough = selection.limit and selection.limit + len(written)
+        found = {body["id"]: body for body in self._unit.select(replace(selection, limit=enough))}
+        for document in written:
+            found[str(document.id)] = self._codec.dump(document).body
+        return selection.arranged(found.values())
+
+    @contextmanager
+    def _running(self, module: str) -> Generator[None]:
+        self._modules.append(module)
+        try:
+            yield
+        finally:
+            self._modules.pop()
+
+    def _require_reach(self, callee: Module, action: str) -> None:
+        caller = self._registry.modules[self.module]
+        if callee is not caller and callee not in caller.requires:
+            raise RemitError(f"{caller.name} cannot {action}: it does not require {callee.name}")
+
+
+class Context(Reader):
+    """A unit of work a handler can change."""
+
+    def __init__(
+        self,
+        *,
+        actor: Actor,
+        now: datetime,
+        unit: Unit,
+        registry: Registry,
+        settings: Mapping[type[BaseModel], BaseModel],
+        module: str,
+    ) -> None:
+        super().__init__(
+            actor=actor, now=now, unit=unit, registry=registry, settings=settings, module=module
+        )
+        self._read_versions: dict[tuple[type[Document], UUID], int] = {}
+        self._emitted: list[Event] = []
+        self._erasures: dict[UUID, type[Document]] = {}
+
+    @property
+    def written(self) -> tuple[Document, ...]:
+        return tuple(self._written.values())
+
+    @property
+    def emitted(self) -> tuple[Event, ...]:
+        return tuple(self._emitted)
+
+    @property
+    def erasures(self) -> tuple[UUID, ...]:
+        return tuple(self._erasures)
+
+    def finish(self) -> None:
+        """Check what can only be checked once the handler has returned.
+
+        An erased document must hold no personal values when the unit commits, however
+        it was written after `erase` was called.
+        """
+        for id, kind in self._erasures.items():
+            self._require_erased(self._get(kind, id))
+
+    def _reading(self) -> Reader:
+        reader = Reader(
+            actor=self.actor,
+            now=self.now,
+            unit=self._unit,
+            registry=self._registry,
+            settings=self._settings,
+            module=self.module,
+        )
+        # The reader stands in this unit of work: it sees what the unit has written,
+        # and runs as whichever module the unit is running.
+        reader._modules = self._modules
+        reader._written = self._written
+        return reader
 
     def create[D: Document](self, document: D) -> D:
         """Add a new document, in its lifecycle's initial state."""
@@ -217,22 +317,9 @@ class Context:
         as its own module, so it writes that module's documents.
         """
         spec = self._registry.command(type(command))
-        caller = self._registry.modules[self.module]
-        callee = self._registry.modules[spec.module]
-        if callee is not caller and callee not in caller.requires:
-            raise RemitError(
-                f"{caller.name} cannot execute {spec.name}: it does not require {callee.name}"
-            )
+        self._require_reach(self._registry.modules[spec.module], f"execute {spec.name}")
         with self._running(spec.module):
             return spec.handler(command, self)
-
-    @contextmanager
-    def _running(self, module: str) -> Generator[None]:
-        self._modules.append(module)
-        try:
-            yield
-        finally:
-            self._modules.pop()
 
     def _require_owner(self, owner: str, action: str) -> None:
         if owner != self.module:

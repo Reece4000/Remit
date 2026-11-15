@@ -22,7 +22,7 @@ class RegistrationError(RemitError):
 
 
 class Unauthorised(RemitError):
-    """The actor does not hold the permission the command requires."""
+    """The actor does not hold the permission that the command or the read requires."""
 
 
 @dataclass(frozen=True)
@@ -61,12 +61,12 @@ class CurrencyMismatch(RemitError):
 
 def invalid(subject: str, error: ValidationError, *, document: str | None = None) -> Rejected:
     """A validation error as a refusal: one line to act on, and a problem for each field."""
-    problems = [Problem(tuple(found["loc"]), _said(found), document) for found in error.errors()]
+    problems = [Problem(tuple(found["loc"]), said(found), document) for found in error.errors()]
     described = "; ".join(f"{_dotted(p.path) or 'value'}: {p.message}" for p in problems)
     return Rejected(f"{subject}: {described}", problems=problems)
 
 
-def _said(found: ErrorDetails) -> str:
+def said(found: ErrorDetails) -> str:
     """What was wrong, in the validator's own words when a validator refused the value.
 
     Pydantic prefixes those with "Value error, ", which reads as noise beside a field.

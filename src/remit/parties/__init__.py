@@ -19,9 +19,6 @@ from .commands import (
     RemoveAddress,
     RemoveContact,
     RestoreParty,
-    addresses,
-    contacts,
-    party,
 )
 from .model import (
     Address,
@@ -81,8 +78,5 @@ __all__ = [
     "RemoveAddress",
     "RemoveContact",
     "RestoreParty",
-    "addresses",
-    "contacts",
     "module",
-    "party",
 ]

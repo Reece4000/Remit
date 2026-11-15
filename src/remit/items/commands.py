@@ -1,6 +1,10 @@
-"""The items module's commands, and how to look an item up."""
+"""The items module's commands.
 
-from remit.kernel import Code, Command, Context, Name, NotFound, Reader, Rejected, UnitCode
+Items are read as any documents are: `page(Item, where={"code": "WASHER-M8"})` finds one
+by its code, and `page(Item, search="washer")` finds those a person might mean.
+"""
+
+from remit.kernel import Code, Command, Context, Name, Rejected, UnitCode
 
 from .model import (
     Description,
@@ -78,11 +82,3 @@ def reinstate_item(command: ReinstateItem, context: Context) -> Item:
     reinstated = context.transition(context.get(Item, command.item_id), "reinstate")
     context.emit(ItemReinstated(item_id=reinstated.id))
     return reinstated
-
-
-def item(reader: Reader, code: str) -> Item:
-    """The item with this code, active or discontinued."""
-    found = reader.find(Item, code=code)
-    if not found:
-        raise NotFound(f"there is no item with code {code!r}")
-    return found[0]

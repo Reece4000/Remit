@@ -1,4 +1,8 @@
-"""Reading the ledger. Balances come from pgledger, which keeps them."""
+"""Reading the ledger. Balances come from pgledger, which keeps them.
+
+The queries are the ledger's public reads: other modules ask them from their handlers
+(`context.ask(AccountBalance(account_id=...))`), and actors ask them through the kernel.
+"""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -6,10 +10,10 @@ from datetime import date, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from remit.kernel import Money, Reader
+from remit.kernel import Money, Query, Reader
 
 from .books import CLEARING, Book, start_of
-from .model import Account, LedgerSettings, PeriodClose
+from .model import Account, AccountId, LedgerSettings, PeriodClose, module
 
 # Both take the account to read, twice, or null for every account. Reading only the books asked
 # for matters beyond speed: a serialisable unit conflicts with whatever writes what it
@@ -58,33 +62,57 @@ class Balance:
         return self.base.is_zero and all(amount.is_zero for amount in self.foreign.values())
 
 
-def balance(reader: Reader, account_id: UUID, *, as_of: date | None = None) -> Balance:
-    """An account's balance, optionally as of the end of a date."""
+class AccountBalance(Query[Balance]):
+    account_id: AccountId
+    as_of: date | None = None
+    """Read the balance as it stood at the end of this date, rather than as it stands now."""
+
+
+class TrialBalance(Query[dict[UUID, Money]]):
+    as_of: date | None = None
+    """Read the balances as they stood at the end of this date."""
+
+
+class ClosedThrough(Query[date | None]):
+    pass
+
+
+class Reconcile(Query[list[str]]):
+    pass
+
+
+@module.query
+def account_balance(query: AccountBalance, reader: Reader) -> Balance:
+    """An account's balance, in the base currency and in each foreign currency it holds."""
+    account = reader.get(Account, query.account_id)
     base = reader.settings(LedgerSettings).base_currency
     held = {
         currency: Money.of(amount, currency)
-        for (_, currency), amount in _books(reader, as_of, account_id).items()
+        for (_, currency), amount in _books(reader, query.as_of, account.id).items()
     }
     return Balance(held.pop(base, Money.zero(base)), held)
 
 
-def trial_balance(reader: Reader, *, as_of: date | None = None) -> dict[UUID, Money]:
-    """Every account's base-currency balance. The values always sum to zero."""
+@module.query
+def trial_balance(query: TrialBalance, reader: Reader) -> dict[UUID, Money]:
+    """Every account's base-currency balance, by account id. The values always sum to zero."""
     base = reader.settings(LedgerSettings).base_currency
     totals = {account.id: Money.zero(base) for account in reader.find(Account)}
-    for (account, currency), amount in _books(reader, as_of, None).items():
+    for (account, currency), amount in _books(reader, query.as_of, None).items():
         if currency == base and account != CLEARING:
             totals[account] = Money.of(amount, base)
     return totals
 
 
-def closed_through(reader: Reader) -> date | None:
-    """The latest date the books are closed through, if any."""
+@module.query
+def closed_through(query: ClosedThrough, reader: Reader) -> date | None:
+    """The latest date the books are closed through, or null if they never have been."""
     return max((close.through for close in reader.find(PeriodClose)), default=None)
 
 
-def reconcile(reader: Reader) -> list[str]:
-    """Check pgledger's books against themselves. Empty when they are sound.
+@module.query
+def reconcile(query: Reconcile, reader: Reader) -> list[str]:
+    """Check the books against themselves; an empty list means they are sound.
 
     Reports any account whose stored balance is not the sum of its entries, and any
     currency whose accounts do not sum to zero.

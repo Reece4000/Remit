@@ -1,4 +1,10 @@
-"""The parties module's commands, and how to look parties and their details up."""
+"""The parties module's commands.
+
+Parties and their details are read as any documents are. A party's current contacts are
+`page(Contact, where={"party_id": party.id, "state": "current"})`; a party is found by
+its code with `where={"code": "C0001"}`, or by what a person remembers of it with
+`search="hollander"`.
+"""
 
 from typing import Annotated
 from uuid import UUID
@@ -12,9 +18,7 @@ from remit.kernel import (
     Context,
     Country,
     Name,
-    NotFound,
     Personal,
-    Reader,
     Rejected,
 )
 
@@ -263,24 +267,6 @@ def remove_address(command: RemoveAddress, context: Context) -> Address:
 def erase_address(command: EraseAddress, context: Context) -> Address:
     """Erase an address's personal data, here and in the audit trail."""
     return _erase_address(context, context.get(Address, command.address_id))
-
-
-def party(reader: Reader, code: str) -> Party:
-    """The party with this code, whatever its state."""
-    found = reader.find(Party, code=code)
-    if not found:
-        raise NotFound(f"there is no party with code {code!r}")
-    return found[0]
-
-
-def contacts(reader: Reader, party_id: UUID) -> list[Contact]:
-    """A party's current contacts, oldest first."""
-    return reader.find(Contact, party_id=party_id, state="current")
-
-
-def addresses(reader: Reader, party_id: UUID) -> list[Address]:
-    """A party's current addresses, oldest first."""
-    return reader.find(Address, party_id=party_id, state="current")
 
 
 def _active(context: Context, party_id: UUID, *, version: int | None = None) -> Party:
