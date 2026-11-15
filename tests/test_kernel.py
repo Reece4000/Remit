@@ -6,7 +6,7 @@ from uuid import UUID, uuid7
 
 import pytest
 from conftest import kernel_on
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from remit.kernel import (
     Actor,
@@ -15,11 +15,14 @@ from remit.kernel import (
     Command,
     ConcurrencyError,
     Context,
+    Country,
     Document,
     Event,
     Kernel,
     Lifecycle,
     Module,
+    NotFound,
+    Problem,
     RegistrationError,
     Rejected,
     RemitError,
@@ -209,8 +212,9 @@ def test_a_change_made_from_an_out_of_date_copy_is_refused(kernel: Kernel, ticke
 
 
 def test_a_transition_waits_for_its_required_fields(kernel: Kernel, ticket: Ticket) -> None:
-    with pytest.raises(Rejected, match="fill in resolution first"):
+    with pytest.raises(Rejected, match="fill in resolution first") as refused:
         kernel.execute(MoveTicket(ticket_id=ticket.id, transition="resolve"), actor=AGENT)
+    assert refused.value.problems == (Problem(("resolution",), "needed to resolve", "desk.ticket"),)
 
     resolved = kernel.execute(
         MoveTicket(ticket_id=ticket.id, transition="resolve", resolution="Replaced toner"),
@@ -403,8 +407,11 @@ ROUTER = Actor(id="router", kind=ActorKind.HUMAN, permissions=frozenset({"routin
 def test_a_unique_value_cannot_be_used_twice(routes: Kernel) -> None:
     routes.execute(CreateQueue(code="IT", email="it@example.com"), actor=ROUTER)
 
-    with pytest.raises(Rejected, match=r"routing\.queue code 'IT' is already in use"):
+    with pytest.raises(Rejected, match=r"routing\.queue code 'IT' is already in use") as refused:
         routes.execute(CreateQueue(code="IT"), actor=ROUTER)
+    assert refused.value.problems == (
+        Problem(("code",), "'IT' is already in use", "routing.queue"),
+    )
     with pytest.raises(Rejected, match=r"routing\.queue email 'it@example\.com' is already in use"):
         routes.execute(CreateQueue(code="HR", email="it@example.com"), actor=ROUTER)
     assert len(routes.find(Queue)) == 1
@@ -729,8 +736,13 @@ def blank(command: Blank, context: Context) -> Ticket:
 
 
 def test_a_change_that_does_not_validate_is_rejected(kernel: Kernel, ticket: Ticket) -> None:
-    with pytest.raises(Rejected, match=r"desk\.ticket .*: subject: Input should be a valid string"):
+    with pytest.raises(
+        Rejected, match=r"desk\.ticket .*: subject: Input should be a valid string"
+    ) as refused:
         kernel.execute(Blank(ticket_id=ticket.id, field="subject"), actor=AGENT)
+    assert refused.value.problems == (
+        Problem(("subject",), "Input should be a valid string", "desk.ticket"),
+    )
     with pytest.raises(RemitError, match=r"desk\.ticket has no fields priority"):
         kernel.execute(Blank(ticket_id=ticket.id, field="priority"), actor=AGENT)
     assert kernel.get(Ticket, ticket.id) == ticket
@@ -777,3 +789,57 @@ def test_a_store_refuses_an_idempotency_key_claimed_since_it_was_read(kernel: Ke
 
     with pytest.raises(ConcurrencyError), kernel.store.unit() as unit:
         unit.commit(claim)
+
+
+# Commands as an API receives them: a registered name and JSON input.
+
+
+def test_a_command_is_built_from_its_name_and_json_input(kernel: Kernel, ticket: Ticket) -> None:
+    command = kernel.command(
+        "desk.rename_ticket", {"ticket_id": str(ticket.id), "subject": "Fax", "version": 1}
+    )
+
+    assert command == RenameTicket(ticket_id=ticket.id, subject="Fax", version=1)
+    assert kernel.execute(command, actor=AGENT).result.subject == "Fax"
+
+
+def test_a_command_no_module_declares_is_not_found(kernel: Kernel) -> None:
+    with pytest.raises(NotFound, match=r"there is no command 'desk\.delete_everything'"):
+        kernel.command("desk.delete_everything", {})
+
+
+def test_input_a_command_does_not_accept_is_refused_field_by_field(kernel: Kernel) -> None:
+    with pytest.raises(Rejected, match=r"^desk\.rename_ticket: ticket_id: ") as refused:
+        kernel.command("desk.rename_ticket", {"ticket_id": "first", "priority": "high"})
+
+    problems = {problem.path: problem for problem in refused.value.problems}
+    assert problems.keys() == {("ticket_id",), ("subject",), ("priority",)}
+    assert problems[("subject",)].message == "Field required"
+    assert problems[("priority",)].message == "Extra inputs are not permitted"
+    assert all(problem.document is None for problem in problems.values())
+
+
+def test_problems_say_where_in_nested_input_and_what_in_the_validators_words() -> None:
+    class Line(BaseModel):
+        quantity: int
+
+    class Order(Command[None]):
+        lines: tuple[Line, ...]
+        country: Country = "GB"
+
+    shop = Module("shop")
+
+    @shop.command
+    def order(command: Order, context: Context) -> None:
+        """Take an order."""
+
+    with pytest.raises(Rejected) as refused:
+        Kernel([shop]).command("shop.order", {"lines": [{"quantity": 1}, {"quantity": "two"}]})
+    [problem] = refused.value.problems
+    assert problem.path == ("lines", 1, "quantity")
+
+    with pytest.raises(Rejected) as refused:
+        Kernel([shop]).command("shop.order", {"lines": [], "country": "UK"})
+    assert refused.value.problems == (
+        Problem(("country",), "'UK' is not an assigned ISO 3166-1 country code"),
+    )

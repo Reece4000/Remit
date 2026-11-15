@@ -15,20 +15,28 @@ conflict, so they are never aborted.
 
 import random
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import cache, partial
 from typing import Any, cast
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .actor import Actor, ActorKind
 from .codec import Codec, unstorable
 from .context import Context
 from .document import Document
-from .errors import ConcurrencyError, RegistrationError, Rejected, RemitError, Unauthorised
+from .errors import (
+    ConcurrencyError,
+    NotFound,
+    RegistrationError,
+    Rejected,
+    RemitError,
+    Unauthorised,
+    invalid,
+)
 from .message import Command, Outcome, Recorded
 from .module import CommandSpec, Module, Subscription
 from .personal import DataKey, carries_personal, seal, unseal
@@ -118,6 +126,20 @@ class Kernel:
             return outcome
 
         return self._in_unit(work)
+
+    def command(self, name: str, input: Mapping[str, object]) -> Command[Any]:
+        """The command registered as `name`, built from JSON input, as an API receives it.
+
+        Refuses a name no installed module declares, and input the command does not
+        accept, with a problem for each field at fault.
+        """
+        spec = self.registry.find_command(name)
+        if spec is None:
+            raise NotFound(f"there is no command {name!r}; the registry describes those installed")
+        try:
+            return spec.command.model_validate(input)
+        except ValidationError as error:
+            raise invalid(name, error) from None
 
     def dispatch(self) -> Dispatched:
         """Deliver recorded events to subscriptions, once each and in order.

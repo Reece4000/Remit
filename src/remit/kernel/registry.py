@@ -25,6 +25,7 @@ class Registry:
         self._events: dict[type[Event], str] = {}
         self._event_owners: dict[type[Event], Module] = {}
         self._commands: dict[type[Command[Any]], CommandSpec] = {}
+        self._command_names: dict[str, CommandSpec] = {}
 
         for module in installation_order(modules):
             if module.name in self.modules:
@@ -56,6 +57,7 @@ class Registry:
                         "in its idempotency record"
                     )
                 self._commands[spec.command] = spec
+                self._command_names[spec.name] = spec
 
         self.subscriptions: tuple[Subscription, ...] = tuple(
             subscription
@@ -73,6 +75,10 @@ class Registry:
 
     def command(self, kind: type[Command[Any]]) -> CommandSpec:
         return _resolve(self._commands, kind, "command")
+
+    def find_command(self, name: str) -> CommandSpec | None:
+        """The command registered as `name`, such as `parties.register_party`, if any."""
+        return self._command_names.get(name)
 
     def document_owner(self, kind: type[Document]) -> Module:
         """The module that declares this document type, and alone may write it."""

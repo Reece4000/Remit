@@ -23,7 +23,7 @@ from pydantic import BaseModel, ValidationError
 from .actor import Actor
 from .codec import Codec
 from .document import Document
-from .errors import NotFound, Rejected, RemitError
+from .errors import NotFound, Problem, Rejected, RemitError, invalid
 from .message import Command, Event
 from .personal import carries_personal, unerased
 from .registry import Registry
@@ -169,7 +169,10 @@ class Context:
         missing = [field for field in step.requires if _blank(getattr(revised, field))]
         if missing:
             kind = self._registry.document_name(type(document))
-            raise Rejected(f"cannot {name} {kind}: fill in {', '.join(missing)} first")
+            raise Rejected(
+                f"cannot {name} {kind}: fill in {', '.join(missing)} first",
+                problems=(Problem((field,), f"needed to {name}", kind) for field in missing),
+            )
         return self._write(revised)
 
     def revise[D: Document](self, document: D, /, **changes: object) -> tuple[D, tuple[str, ...]]:
@@ -260,7 +263,10 @@ class Context:
                 other.id != document.id for other in self.find(type(document), **{field: value})
             ):
                 name = self._registry.document_name(type(document))
-                raise Rejected(f"{name} {field} {value!r} is already in use")
+                raise Rejected(
+                    f"{name} {field} {value!r} is already in use",
+                    problems=(Problem((field,), f"{value!r} is already in use", name),),
+                )
 
     def _write[D: Document](self, document: D) -> D:
         name = self._registry.document_name(type(document))
@@ -284,15 +290,7 @@ class Context:
             return type(document).model_validate({**dict(document), **changes, **kernel_set})
         except ValidationError as error:
             name = self._registry.document_name(type(document))
-            raise Rejected(f"{name} {document.id}: {_problems(error)}") from None
-
-
-def _problems(error: ValidationError) -> str:
-    """A validation error as one line someone can act on."""
-    return "; ".join(
-        f"{'.'.join(map(str, problem['loc'])) or 'value'}: {problem['msg']}"
-        for problem in error.errors()
-    )
+            raise invalid(f"{name} {document.id}", error, document=name) from None
 
 
 def _blank(value: object) -> bool:
