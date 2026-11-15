@@ -41,6 +41,9 @@ step "tests"
 step "coverage"
 .venv/bin/coverage report
 
+# The floor may rise but never fall below the one on main.
+.venv/bin/python checks/floor.py
+
 if [[ "${1:-}" == "--deep" ]]; then
     step "deep: known vulnerabilities in dependencies"
     .venv/bin/pip-audit --skip-editable --progress-spinner off

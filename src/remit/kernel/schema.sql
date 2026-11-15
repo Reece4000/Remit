@@ -11,6 +11,12 @@ CREATE TABLE IF NOT EXISTS migrations (
     PRIMARY KEY (module, name)
 );
 
+CREATE TABLE IF NOT EXISTS installed_modules (
+    module       text        PRIMARY KEY,
+    fingerprint  text        NOT NULL,
+    installed_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     kind    text    NOT NULL,
     id      uuid    NOT NULL,
@@ -39,6 +45,22 @@ CREATE TABLE IF NOT EXISTS audit (
     events    jsonb       NOT NULL,
     cause     bigint
 );
+
+ALTER TABLE audit ADD COLUMN IF NOT EXISTS key uuid;
+
+-- Data keys seal personal values in the audit trail and idempotency records. Deleting a
+-- key erases what it sealed; these are the only tables rows are deleted from.
+CREATE TABLE IF NOT EXISTS data_keys (
+    id     uuid  PRIMARY KEY,
+    secret bytea NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS data_key_subjects (
+    key_id  uuid NOT NULL REFERENCES data_keys (id) ON DELETE CASCADE,
+    subject uuid NOT NULL,
+    PRIMARY KEY (key_id, subject)
+);
+CREATE INDEX IF NOT EXISTS data_key_subjects_subject ON data_key_subjects (subject);
 
 CREATE TABLE IF NOT EXISTS cursors (
     subscription text   PRIMARY KEY,

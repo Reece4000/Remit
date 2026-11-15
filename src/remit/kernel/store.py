@@ -19,6 +19,7 @@ from uuid import UUID
 
 from .actor import Actor
 from .errors import ConcurrencyError, RemitError
+from .module import Module
 
 type Json = dict[str, Any]
 
@@ -52,6 +53,17 @@ class AuditEntry:
     events: tuple[str, ...]
     cause: int | None = None
     """Log position of the event that triggered this, when a subscription ran."""
+    key: UUID | None = None
+    """The data key personal values in `input` are sealed with, if it holds any."""
+
+
+@dataclass(frozen=True)
+class SubjectKey:
+    """A data key, and the data subjects whose personal values it seals."""
+
+    id: UUID
+    secret: bytes
+    subjects: tuple[UUID, ...]
 
 
 @dataclass(frozen=True)
@@ -63,6 +75,9 @@ class Commit:
     audit: AuditEntry
     cursor: tuple[str, int] | None = None
     idempotency: tuple[str, Json] | None = None
+    keys: tuple[SubjectKey, ...] = ()
+    erasures: tuple[UUID, ...] = ()
+    """Data subjects whose keys are deleted, after `keys` are stored."""
 
 
 class Unit(Protocol):
@@ -78,6 +93,10 @@ class Unit(Protocol):
 
     def cursor(self, subscription: str) -> int: ...
     def idempotency(self, key: str) -> Json | None: ...
+    def secret(self, key: UUID) -> bytes | None:
+        """A data key's secret, or None once the data it sealed has been erased."""
+        ...
+
     def audit(self) -> list[AuditEntry]: ...
     def commit(self, commit: Commit) -> None: ...
 
@@ -96,11 +115,19 @@ class Store(Protocol):
 
     def unit(self) -> AbstractContextManager[Unit]: ...
 
+    def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
+        """Why this store cannot yet run these modules. Empty when it can."""
+        ...
+
 
 class MemoryStore:
     """A store for tests and local runs. Units run one at a time, which is serialisable."""
 
     runs_sql = False
+
+    def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
+        """Nothing: a memory store needs no installation."""
+        return ()
 
     def __init__(self) -> None:
         self._documents: defaultdict[str, dict[UUID, StoredDocument]] = defaultdict(dict)
@@ -108,6 +135,8 @@ class MemoryStore:
         self._audit: list[AuditEntry] = []
         self._cursors: dict[str, int] = {}
         self._idempotency: dict[str, Json] = {}
+        self._secrets: dict[UUID, bytes] = {}
+        self._subjects: dict[UUID, set[UUID]] = {}
         self._lock = threading.RLock()
 
     @contextmanager
@@ -141,6 +170,9 @@ class MemoryStore:
     def audit(self) -> list[AuditEntry]:
         return list(self._audit)
 
+    def secret(self, key: UUID) -> bytes | None:
+        return self._secrets.get(key)
+
     def commit(self, commit: Commit) -> None:
         for document in commit.documents:
             stored = self._documents[document.kind].get(document.id)
@@ -163,6 +195,12 @@ class MemoryStore:
         if commit.idempotency:
             key, record = commit.idempotency
             self._idempotency[key] = record
+        for data_key in commit.keys:
+            self._secrets[data_key.id] = data_key.secret
+            self._subjects[data_key.id] = set(data_key.subjects)
+        erased = set(commit.erasures)
+        for key_id in [k for k, subjects in self._subjects.items() if subjects & erased]:
+            del self._secrets[key_id], self._subjects[key_id]
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
         raise RemitError("this needs a PostgreSQL store; the memory store cannot run SQL")

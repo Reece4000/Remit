@@ -36,6 +36,10 @@ entry in the audit trail.
 - **Everything is described by its own declarations.** Documents, lifecycles, commands
   and events are available as JSON Schema from the registry. A declaration without a
   docstring does not register.
+- **Personal data can be erased without rewriting history.** Fields marked personal are
+  stored encrypted in the audit trail under keys that belong to the person they are
+  about; erasing the person deletes the keys. See
+  [personal data](docs/personal-data.md).
 - **Modules build on modules.** A module declares the modules it requires, may use
   only their public API and react only to their events, and brings them with it when
   installed. Remit's own standard modules follow the same rules as anyone else's.
@@ -122,20 +126,20 @@ kernel = Kernel(
 
 agent = Actor(id="agent:dispatch", kind=ActorKind.AGENT, permissions=frozenset({"shipping.*"}))
 
-packed = kernel.execute(PackConsignment(destination="Nairobi"), actor=agent).result
+packed = kernel.execute(PackConsignment(destination="Rotterdam"), actor=agent).result
 
 try:
     kernel.execute(BookConsignment(consignment_id=packed.id), actor=agent)
 except Rejected as refusal:
     print(refusal)  # cannot book shipping.consignment: fill in carrier, waybill first
 
-book = BookConsignment(consignment_id=packed.id, carrier="KQ", waybill="706-12345675")
+book = BookConsignment(consignment_id=packed.id, carrier="DHL", waybill="1234567890")
 
 preview = kernel.execute(book, actor=agent, dry_run=True)
 print(preview.result.state)  # booked, and nothing was saved
 
-kernel.execute(book, actor=agent, idempotency_key="book-706-12345675")
-kernel.execute(book, actor=agent, idempotency_key="book-706-12345675")  # runs once
+kernel.execute(book, actor=agent, idempotency_key="book-1234567890")
+kernel.execute(book, actor=agent, idempotency_key="book-1234567890")  # runs once
 ```
 
 The ledger is a module like any other. Each posting carries its amount in its own
@@ -189,10 +193,23 @@ which puts the posting in the same transaction as the document that caused it.
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
 | A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
 | Codes and other unique values are never shared | A document's `unique` fields, checked by the kernel and indexed by the database | Threads racing for the same code, and direct inserts of a duplicate |
-| A module reaches only what it declares it requires | The registry, and an architecture test over every import | Modules that try to react to undeclared events |
+| A module imports, and reacts to events from, only the modules it requires | An architecture test over every import; the registry, for subscriptions | Modules that try to react to undeclared events |
+| Personal data in the audit trail is unreadable once its subject is erased, and never stored in the clear | Encryption under per-subject keys, and registration refuses personal data in events | Raw tables searched for personal values; erasure through nested data and replays |
+| A kernel runs only modules its database was installed with, as currently defined | Each install records a fingerprint of the module's migrations, rules and unique fields | Kernels started against missing or changed installs |
 
-`./check --deep` goes one step further: it breaks the framework in fourteen ways, one at
+`./check --deep` goes one step further: it breaks the framework in seventeen ways, one at
 a time, and confirms the tests fail for each.
+
+Some things are trusted rather than checked, because modules are code you choose to
+install:
+
+- `context.sql` runs any SQL in the unit of work, so a module that uses it could read
+  other modules' tables or documents.
+- `context.execute` runs another module's command on the authority of the command
+  already running, without checking that permission again. That is deliberate: a clerk
+  who may issue an invoice should not also need permission to post journal entries for
+  the invoice to reach the ledger. Permissions are checked once, where an actor issues
+  a command.
 
 ## Getting started
 
@@ -233,7 +250,7 @@ Kernel tests run in memory and on PostgreSQL; ledger tests need PostgreSQL. Runn
 | `src/remit/ledger` | General ledger: accounts, journal entries, reversals, period closes. Built only on the kernel's public API. `books.py` is the bridge to pgledger, `rules.sql` holds what the database enforces, `vendor/pgledger` is pgledger v0.9.0 itself, unmodified. |
 | `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands. |
 | `checks` | The mutation checks behind `./check --deep`. |
-| `docs` | Design notes. |
+| `docs` | Design notes: [modules and templates](docs/modules-and-templates.md), [personal data](docs/personal-data.md). |
 | `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. |
 
 Two layering rules are enforced by a test: the kernel imports no module, and a module
@@ -272,3 +289,5 @@ commercial licence.
 
 The vendored copy of pgledger and its ULID helpers keep their own licences (MIT and
 BSD 3-Clause), which are included alongside them in `src/remit/ledger/vendor/pgledger`.
+The unit of measure codes in `src/remit/kernel/data/units.tsv` are UN/ECE
+Recommendations 20 and 21, as published by OpenPeppol.

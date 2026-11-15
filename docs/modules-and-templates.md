@@ -16,7 +16,7 @@ primitive that any module could use, and the standard module uses that. The kern
 learns what a sales order is.
 
 This makes the standard modules the proof of extensibility. If sales can be built from
-outside the kernel, so can a customer's air waybill module.
+outside the kernel, so can any module a customer writes for themselves.
 
 ## Modules
 
@@ -30,12 +30,12 @@ A module declares documents, events, commands and subscriptions (as now), plus:
   and the top-level package of each dependency, and nothing deeper, which
   `tests/test_architecture.py` checks.
 - **Extensions to other modules' documents.** A module can add fields to a document it
-  does not own. For example, an export module adds a hazard class to an item. The
+  does not own. For example, a warranty module adds a warranty period to an item. The
   owning module doesn't know about the extension, and the extension is namespaced so two
   modules cannot collide.
 - **Guards on other modules' transitions.** A module can refuse a transition it does
-  not own, giving the reason in the same words as any other refusal. For example, a
-  shipment cannot be dispatched until its air waybill is complete. This is how a custom
+  not own, giving the reason in the same words as any other refusal. For example, an
+  order cannot be released until a credit check has passed. This is how a custom
   module changes a standard process without editing it.
 - **Links between lines.** A purchase order line records which sales order line it was
   raised for, and a packing line records which order line it fulfils. Quantities
@@ -54,7 +54,7 @@ contains:
 - a chart of accounts, tax codes and number series
 - roles for people and agents, with permissions and limits
 - approval rules and workflows
-- document layouts (quotes, invoices, waybills)
+- document layouts (quotes, invoices, delivery notes)
 - optionally, sample data to practise on
 
 A template is data, and applying one means executing commands as a setup actor. So it is

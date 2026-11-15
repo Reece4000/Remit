@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from remit.kernel import Code, Command, Context, Name, NotFound, Reader, Rejected
+from remit.kernel import Code, Command, Context, Name, NotFound, Reader, Rejected, UnitCode
 
 from .model import (
     Description,
@@ -12,7 +12,6 @@ from .model import (
     ItemDiscontinued,
     ItemKind,
     ItemReinstated,
-    Unit,
     module,
 )
 
@@ -23,7 +22,7 @@ class AddItem(Command[Item]):
     code: Code
     kind: ItemKind
     name: Name
-    unit: Unit = "each"
+    unit: UnitCode = "EA"
     description: Description | None = None
 
 

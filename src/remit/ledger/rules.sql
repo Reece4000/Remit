@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS ledger_books (
     PRIMARY KEY (account, currency)
 );
 
--- Account codes are unique through `Account.unique`, which the kernel indexes.
+-- Account codes are unique through `Account.unique`, which the kernel indexes. Earlier
+-- versions indexed them here, under a name the kernel does not manage; remove it.
 DROP INDEX IF EXISTS ledger_account_code;
 
 -- pgledger only ever inserts into these two tables, so nothing legitimate is blocked.

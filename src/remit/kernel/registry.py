@@ -7,10 +7,13 @@ source everything outside the kernel (API schema, agent tools, docs) is generate
 from collections.abc import Iterable
 from typing import Any
 
+from pydantic import BaseModel
+
 from .document import Document
 from .errors import RegistrationError
 from .message import Command, Event
 from .module import CommandSpec, Module, Subscription, installation_order
+from .personal import carries_personal, unsealable
 
 
 class Registry:
@@ -28,11 +31,19 @@ class Registry:
             self.modules[module.name] = module
             for name, document in module.documents.items():
                 _check_lifecycle(name, document)
+                _check_sealable(name, document)
                 self._documents[document] = name
             for name, event in module.events.items():
+                _check_sealable(name, event)
+                if carries_personal(event):
+                    raise RegistrationError(
+                        f"{name} carries personal data; events are kept for good and sent to "
+                        "every subscriber, so they carry ids and codes, never personal values"
+                    )
                 self._events[event] = name
                 self._event_owners[event] = module
             for spec in module.commands.values():
+                _check_sealable(spec.name, spec.command)
                 self._commands[spec.command] = spec
 
         self.subscriptions: tuple[Subscription, ...] = tuple(
@@ -129,6 +140,11 @@ def _check_lifecycle(name: str, document: type[Document]) -> None:
             raise RegistrationError(
                 f"{name}: transition {transition.name!r} requires unknown fields {unknown}"
             )
+
+
+def _check_sealable(name: str, model: type[BaseModel]) -> None:
+    if reason := unsealable(model):
+        raise RegistrationError(f"{name}: {reason}, where it could not be sealed")
 
 
 def _resolve[K, V](declared: dict[K, V], kind: K, what: str) -> V:

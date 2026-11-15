@@ -7,6 +7,7 @@ license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "src/remit/ledger/vendor/pgledger/LICENSE*"]
 requires-python = ">=3.14"
 dependencies = [
+    "cryptography>=46",
     "psycopg[binary,pool]>=3.2",
     "pycountry>=24.6",
     "pydantic[email]>=2.12",
@@ -31,6 +32,7 @@ packages = ["src/remit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 100
@@ -53,7 +55,7 @@ source = ["remit"]
 
 [tool.coverage.report]
 # A floor, not a target: raise it as gaps are closed, never lower it.
-fail_under = 96.7
+fail_under = 97.4
 precision = 1
 show_missing = true
 skip_covered = true

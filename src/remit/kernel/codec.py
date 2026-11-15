@@ -9,6 +9,7 @@ from .document import Document
 from .errors import RemitError
 from .message import Command, Event, Outcome, Recorded
 from .module import CommandSpec
+from .personal import DataKey, seal
 from .registry import Registry
 from .store import Json, StoredDocument, StoredEvent
 
@@ -41,12 +42,20 @@ class Codec:
         event = self._registry.event_type(stored.name).model_validate(stored.body)
         return Recorded(stored.position, stored.name, event, stored.at, stored.actor)
 
-    def dump_outcome(self, spec: CommandSpec, command: Command[Any], outcome: Outcome[Any]) -> Json:
+    def dump_outcome(
+        self, spec: CommandSpec, command: Command[Any], outcome: Outcome[Any], key: DataKey
+    ) -> Json:
+        """What an idempotent command did, with its personal values sealed under `key`."""
         return {
-            "command": command.model_dump(mode="json"),
-            "result": spec.returns.dump_python(outcome.result, mode="json"),
+            "command": seal(command, command.model_dump(mode="json"), key),
+            "result": seal(
+                outcome.result, spec.returns.dump_python(outcome.result, mode="json"), key
+            ),
             "documents": [
-                [stored.kind, stored.body] for stored in map(self.dump, outcome.documents)
+                [stored.kind, seal(document, stored.body, key)]
+                for document, stored in zip(
+                    outcome.documents, map(self.dump, outcome.documents), strict=True
+                )
             ],
             "events": [list(self.dump_event(event)) for event in outcome.events],
         }

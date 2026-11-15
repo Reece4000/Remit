@@ -10,11 +10,10 @@ from uuid import UUID
 
 from pydantic import StringConstraints
 
-from remit.kernel import Code, Document, Event, Lifecycle, Module, Name, Transition
+from remit.kernel import Code, Document, Event, Lifecycle, Module, Name, Transition, UnitCode
 
 module = Module("items")
 
-Unit = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20)]
 Description = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
@@ -46,8 +45,10 @@ class Item(Document):
     code: Code
     kind: ItemKind
     name: Name
-    unit: Unit = "each"
-    """What one of this item is, such as each, kg, hour or box of 100."""
+    unit: UnitCode = "EA"
+    """What one of this item is, as a unit code: EA (each), KGM (kilogram), HUR (hour),
+    XBX (box). How many of one unit make another (a box holds 96) is data that the
+    modules handling quantities keep, not part of the unit."""
     description: Description | None = None
 
 

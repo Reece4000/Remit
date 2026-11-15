@@ -17,6 +17,7 @@ from .codec import Codec
 from .document import Document
 from .errors import NotFound, Rejected, RemitError
 from .message import Command, Event
+from .personal import carries_personal, unerased
 from .registry import Registry
 from .store import Unit
 
@@ -27,7 +28,7 @@ class Reader(Protocol):
     """Read access to documents and settings. The kernel and the context both provide it."""
 
     def get[D: Document](self, kind: type[D], id: UUID) -> D: ...
-    def find[D: Document](self, kind: type[D], **equals: object) -> list[D]: ...
+    def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]: ...
     def settings[S: BaseModel](self, kind: type[S]) -> S: ...
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]: ...
 
@@ -51,6 +52,7 @@ class Context:
         self._written: dict[tuple[type[Document], UUID], Document] = {}
         self._read_versions: dict[tuple[type[Document], UUID], int] = {}
         self._emitted: list[Event] = []
+        self._erasures: list[UUID] = []
 
     @property
     def written(self) -> tuple[Document, ...]:
@@ -59,6 +61,10 @@ class Context:
     @property
     def emitted(self) -> tuple[Event, ...]:
         return tuple(self._emitted)
+
+    @property
+    def erasures(self) -> tuple[UUID, ...]:
+        return tuple(self._erasures)
 
     def get[D: Document](self, kind: type[D], id: UUID, *, version: int | None = None) -> D:
         """A document by id. With `version`, refuse if it has changed since that version.
@@ -84,7 +90,7 @@ class Context:
             raise NotFound(f"there is no {name} with id {id}")
         return self._codec.load(kind, body)
 
-    def find[D: Document](self, kind: type[D], **equals: object) -> list[D]:
+    def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]:
         """Documents whose fields equal the given values, oldest first."""
         stored = self._unit.find(self._registry.document_name(kind), self._codec.filters(equals))
         found = {document.id: document for document in (self._codec.load(kind, b) for b in stored)}
@@ -110,7 +116,7 @@ class Context:
             raise Rejected(f"a new {name} must be unversioned and in its initial state")
         return self._write(document)
 
-    def update[D: Document](self, document: D, **changes: object) -> D:
+    def update[D: Document](self, document: D, /, **changes: object) -> D:
         """Change fields without changing state. Final documents cannot be updated."""
         self._require_current(document)
         if document.is_final:
@@ -118,7 +124,7 @@ class Context:
             raise Rejected(f"{name} {document.id} is {document.state} and can no longer change")
         return self._write(_revise(document, changes))
 
-    def transition[D: Document](self, document: D, name: str, **changes: object) -> D:
+    def transition[D: Document](self, document: D, name: str, /, **changes: object) -> D:
         """Move a document along its lifecycle, optionally filling in fields as it goes."""
         self._require_current(document)
         step = document.lifecycle.find(name, document.state)
@@ -128,6 +134,35 @@ class Context:
             kind = self._registry.document_name(type(document))
             raise Rejected(f"cannot {name} {kind}: fill in {', '.join(missing)} first")
         return self._write(revised)
+
+    def revise[D: Document](self, document: D, /, **changes: object) -> tuple[D, tuple[str, ...]]:
+        """Replace some of a document's fields, refusing if none would change.
+
+        Returns the revised document and the names of the fields that changed, in the
+        order given, for the event that reports the change.
+        """
+        changed = tuple(
+            field for field, value in changes.items() if getattr(document, field) != value
+        )
+        if not changed:
+            name = self._registry.document_name(type(document))
+            raise Rejected(f"nothing would change: {name} {document.id} already has these details")
+        return self.update(document, **changes), changed
+
+    def erase(self, document: Document) -> None:
+        """Erase what the audit trail holds about this data subject, when this unit commits.
+
+        Replace the document's personal fields first (with `ERASED`, null or empty): the
+        audit trail's copies become unreadable, and the live document must not keep them.
+        """
+        name = self._registry.document_name(type(document))
+        if not carries_personal(type(document)):
+            raise RemitError(f"{name} holds no personal data to erase")
+        if kept := unerased(self.get(type(document), document.id)):
+            raise RemitError(
+                f"replace {name}'s personal fields before erasing it: {', '.join(kept)}"
+            )
+        self._erasures.append(document.id)
 
     def emit(self, event: Event) -> None:
         """Publish an event. It is recorded only if this unit of work commits."""

@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from conftest import DSN
+from conftest import DSN, kernel_on
 from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, desk
 
 from remit import items, ledger, parties
@@ -27,10 +27,10 @@ def gbp(amount: str) -> Money:
 
 @pytest.fixture
 def kernel(postgres: PostgresStore) -> Kernel:
-    return Kernel(
+    return kernel_on(
+        postgres,
         [ledger.module, desk, parties.module, items.module],
         settings=[ledger.LedgerSettings(base_currency="GBP")],
-        store=postgres,
     )
 
 
@@ -140,6 +140,34 @@ def test_the_database_itself_refuses_a_duplicate_code(kernel: Kernel) -> None:
         )
 
 
+def test_personal_data_is_stored_only_sealed(kernel: Kernel) -> None:
+    amy = kernel.execute(
+        parties.RegisterParty(code="P0001", kind=parties.PartyKind.PERSON, name="Amy Shaw"),
+        actor=CLERK,
+        idempotency_key="register-amy",
+    ).result
+    kernel.execute(
+        parties.AddContact(party_id=amy.id, name="Amy Shaw", email="amy@example.com"),
+        actor=CLERK,
+    )
+
+    with psycopg.connect(DSN) as connection:
+        (kept,) = connection.execute(
+            "SELECT (SELECT string_agg(input::text, ' ') FROM audit) || "
+            "(SELECT string_agg(record::text, ' ') FROM idempotency)"
+        ).fetchone() or ("",)
+    assert "Amy Shaw" not in kept
+    assert "amy@example.com" not in kept
+    assert "P0001" in kept, "codes are not personal and stay readable"
+
+    kernel.execute(parties.EraseParty(party_id=amy.id), actor=CLERK)
+    with psycopg.connect(DSN) as connection:
+        (left,) = connection.execute(
+            "SELECT count(*) FROM data_key_subjects WHERE subject = %s", (amy.id,)
+        ).fetchone() or (None,)
+    assert left == 0
+
+
 def test_pgledger_itself_refuses_a_transfer_into_a_closed_period(kernel: Kernel, accounts) -> None:
     post(kernel, accounts, date(2026, 3, 1))
     kernel.execute(ledger.ClosePeriod(through=date(2026, 3, 31)), actor=BOOKKEEPER)
@@ -184,15 +212,17 @@ def test_one_party_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) 
     results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
 
     assert sum(isinstance(result, parties.Party) for result in results) == 1
+    assert sum(isinstance(result, Rejected) for result in results) == 7
     assert len(kernel.find(parties.Party)) == 1
 
 
 def test_one_item_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
-    claim = items.AddItem(code="PIP-200", kind=items.ItemKind.GOODS, name="Pipette")
+    claim = items.AddItem(code="BOLT-M8", kind=items.ItemKind.GOODS, name="Hex bolt")
 
     results = race(8, lambda _: kernel.execute(claim, actor=CLERK).result)
 
     assert sum(isinstance(result, items.Item) for result in results) == 1
+    assert sum(isinstance(result, Rejected) for result in results) == 7
     assert len(kernel.find(items.Item)) == 1
 
 
@@ -202,12 +232,7 @@ def test_of_many_amendments_from_the_same_copy_exactly_one_lands(kernel: Kernel)
 
     def amend(number: int) -> parties.Party:
         renamed = parties.AmendParty(
-            party_id=amy.id,
-            version=amy.version,
-            name=f"Amy {number}",
-            tax_number=None,
-            addresses=(),
-            contacts=(),
+            party_id=amy.id, version=amy.version, name=f"Amy {number}", tax_number=None
         )
         return kernel.execute(renamed, actor=CLERK).result
 

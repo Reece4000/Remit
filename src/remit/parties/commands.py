@@ -1,15 +1,39 @@
-"""The parties module's commands, and how to look a party up."""
+"""The parties module's commands, and how to look parties and their details up."""
 
+from typing import Annotated
 from uuid import UUID
 
-from remit.kernel import Code, Command, Context, Name, NotFound, Reader, Rejected
+from pydantic import EmailStr, Field
+
+from remit.kernel import (
+    ERASED,
+    Code,
+    Command,
+    Context,
+    Country,
+    Name,
+    NotFound,
+    Personal,
+    Reader,
+    Rejected,
+)
 
 from .model import (
     Address,
+    AddressAdded,
+    AddressAmended,
+    AddressErased,
+    AddressRemoved,
     Contact,
+    ContactAdded,
+    ContactAmended,
+    ContactErased,
+    ContactRemoved,
+    Line,
     Party,
     PartyAmended,
     PartyArchived,
+    PartyErased,
     PartyKind,
     PartyRegistered,
     PartyRestored,
@@ -17,32 +41,28 @@ from .model import (
     module,
 )
 
-_AMENDABLE = ("name", "tax_number", "addresses", "contacts")
+Lines = Annotated[tuple[Line, ...], Personal, Field(min_length=1, max_length=6)]
 
 
 class RegisterParty(Command[Party]):
     code: Code
     kind: PartyKind
-    name: Name
-    tax_number: TaxNumber | None = None
-    addresses: tuple[Address, ...] = ()
-    contacts: tuple[Contact, ...] = ()
+    name: Annotated[Name, Personal]
+    tax_number: Annotated[TaxNumber | None, Personal] = None
 
 
 class AmendParty(Command[Party]):
-    """Replace a party's details.
+    """Replace a party's name and tax number.
 
-    Every field is required, so that nothing is cleared by being left out: send each one
-    as it should now be, including an empty list or null to clear it.
+    Both are required, so that nothing is cleared by being left out: send null to clear
+    the tax number.
     """
 
     party_id: UUID
     version: int
     """The version these details were read at. Refused if the party has changed since."""
-    name: Name
-    tax_number: TaxNumber | None
-    addresses: tuple[Address, ...]
-    contacts: tuple[Contact, ...]
+    name: Annotated[Name, Personal]
+    tax_number: Annotated[TaxNumber | None, Personal]
 
 
 class ArchiveParty(Command[Party]):
@@ -51,6 +71,64 @@ class ArchiveParty(Command[Party]):
 
 class RestoreParty(Command[Party]):
     party_id: UUID
+
+
+class EraseParty(Command[Party]):
+    party_id: UUID
+
+
+class AddContact(Command[Contact]):
+    party_id: UUID
+    name: Annotated[Name, Personal]
+    role: Name | None = None
+    email: Annotated[EmailStr | None, Personal] = None
+    phone: Annotated[Line | None, Personal] = None
+
+
+class AmendContact(Command[Contact]):
+    """Replace a contact's details. Every field is required; send null to clear one."""
+
+    contact_id: UUID
+    version: int
+    """The version these details were read at. Refused if the contact has changed since."""
+    name: Annotated[Name, Personal]
+    role: Name | None
+    email: Annotated[EmailStr | None, Personal]
+    phone: Annotated[Line | None, Personal]
+
+
+class RemoveContact(Command[Contact]):
+    contact_id: UUID
+
+
+class EraseContact(Command[Contact]):
+    contact_id: UUID
+
+
+class AddAddress(Command[Address]):
+    party_id: UUID
+    label: Name
+    lines: Lines
+    country: Country
+
+
+class AmendAddress(Command[Address]):
+    """Replace an address. Every field is required."""
+
+    address_id: UUID
+    version: int
+    """The version this address was read at. Refused if it has changed since."""
+    label: Name
+    lines: Lines
+    country: Country
+
+
+class RemoveAddress(Command[Address]):
+    address_id: UUID
+
+
+class EraseAddress(Command[Address]):
+    address_id: UUID
 
 
 @module.command
@@ -63,15 +141,9 @@ def register_party(command: RegisterParty, context: Context) -> Party:
 
 @module.command
 def amend_party(command: AmendParty, context: Context) -> Party:
-    """Change a party's name, tax number, addresses or contacts. Its code and kind are fixed."""
-    party = context.get(Party, command.party_id, version=command.version)
-    if party.state == "archived":
-        raise Rejected(f"party {party.code} is archived; restore it before amending it")
-    changes = {field: getattr(command, field) for field in _AMENDABLE}
-    changed = tuple(field for field, value in changes.items() if getattr(party, field) != value)
-    if not changed:
-        raise Rejected(f"nothing would change: party {party.code} already has these details")
-    amended = context.update(party, **changes)
+    """Change a party's name or tax number. Its code and kind are fixed."""
+    party = _active(context, command.party_id, version=command.version)
+    amended, changed = context.revise(party, name=command.name, tax_number=command.tax_number)
     context.emit(PartyAmended(party_id=party.id, changed=changed))
     return amended
 
@@ -92,9 +164,148 @@ def restore_party(command: RestoreParty, context: Context) -> Party:
     return restored
 
 
+@module.command
+def erase_party(command: EraseParty, context: Context) -> Party:
+    """Erase a person's personal data, with all their contacts and addresses.
+
+    Only a person can be erased: an organisation is not a data subject. Its people are
+    its contacts, and each of them can be erased on their own.
+    """
+    party = context.get(Party, command.party_id)
+    if party.kind is not PartyKind.PERSON:
+        raise Rejected(
+            f"party {party.code} is an organisation, not a person; erase its contacts instead"
+        )
+    for contact in context.find(Contact, party_id=party.id):
+        if contact.state != "erased":
+            _erase_contact(context, contact)
+    for address in context.find(Address, party_id=party.id):
+        if address.state != "erased":
+            _erase_address(context, address)
+    erased = context.transition(party, "erase", name=ERASED, tax_number=None)
+    context.erase(erased)
+    context.emit(PartyErased(party_id=party.id))
+    return erased
+
+
+@module.command
+def add_contact(command: AddContact, context: Context) -> Contact:
+    """Add someone at a party, and how to reach them."""
+    _active(context, command.party_id)
+    contact = context.create(Contact.model_validate(command.model_dump()))
+    context.emit(ContactAdded(contact_id=contact.id, party_id=contact.party_id))
+    return contact
+
+
+@module.command
+def amend_contact(command: AmendContact, context: Context) -> Contact:
+    """Change a contact's name, role, email or phone."""
+    contact = context.get(Contact, command.contact_id, version=command.version)
+    _require_changeable(context, contact, "contact")
+    amended, changed = context.revise(
+        contact, name=command.name, role=command.role, email=command.email, phone=command.phone
+    )
+    context.emit(ContactAmended(contact_id=contact.id, changed=changed))
+    return amended
+
+
+@module.command
+def remove_contact(command: RemoveContact, context: Context) -> Contact:
+    """Stop using a contact. Its history is kept."""
+    contact = context.get(Contact, command.contact_id)
+    _require_changeable(context, contact, "contact")
+    removed = context.transition(contact, "remove")
+    context.emit(ContactRemoved(contact_id=removed.id))
+    return removed
+
+
+@module.command
+def erase_contact(command: EraseContact, context: Context) -> Contact:
+    """Erase a contact's personal data, here and in the audit trail."""
+    return _erase_contact(context, context.get(Contact, command.contact_id))
+
+
+@module.command
+def add_address(command: AddAddress, context: Context) -> Address:
+    """Add a postal address to a party."""
+    _active(context, command.party_id)
+    address = context.create(Address.model_validate(command.model_dump()))
+    context.emit(AddressAdded(address_id=address.id, party_id=address.party_id))
+    return address
+
+
+@module.command
+def amend_address(command: AmendAddress, context: Context) -> Address:
+    """Change an address."""
+    address = context.get(Address, command.address_id, version=command.version)
+    _require_changeable(context, address, "address")
+    amended, changed = context.revise(
+        address, label=command.label, lines=command.lines, country=command.country
+    )
+    context.emit(AddressAmended(address_id=address.id, changed=changed))
+    return amended
+
+
+@module.command
+def remove_address(command: RemoveAddress, context: Context) -> Address:
+    """Stop using an address. Its history is kept."""
+    address = context.get(Address, command.address_id)
+    _require_changeable(context, address, "address")
+    removed = context.transition(address, "remove")
+    context.emit(AddressRemoved(address_id=removed.id))
+    return removed
+
+
+@module.command
+def erase_address(command: EraseAddress, context: Context) -> Address:
+    """Erase an address's personal data, here and in the audit trail."""
+    return _erase_address(context, context.get(Address, command.address_id))
+
+
 def party(reader: Reader, code: str) -> Party:
-    """The party with this code, active or archived."""
+    """The party with this code, whatever its state."""
     found = reader.find(Party, code=code)
     if not found:
         raise NotFound(f"there is no party with code {code!r}")
     return found[0]
+
+
+def contacts(reader: Reader, party_id: UUID) -> list[Contact]:
+    """A party's current contacts, oldest first."""
+    return reader.find(Contact, party_id=party_id, state="current")
+
+
+def addresses(reader: Reader, party_id: UUID) -> list[Address]:
+    """A party's current addresses, oldest first."""
+    return reader.find(Address, party_id=party_id, state="current")
+
+
+def _active(context: Context, party_id: UUID, *, version: int | None = None) -> Party:
+    party = context.get(Party, party_id, version=version)
+    if party.state != "active":
+        raise Rejected(f"party {party.code} is {party.state}; it cannot be changed")
+    return party
+
+
+def _require_changeable(context: Context, detail: Contact | Address, what: str) -> None:
+    """A contact or address changes only while it is current and its party is active.
+
+    Erasure is the exception: it is always allowed, whatever the party's state.
+    """
+    _active(context, detail.party_id)
+    if detail.state != "current":
+        raise Rejected(f"this {what} is {detail.state}; it cannot be changed")
+
+
+def _erase_contact(context: Context, contact: Contact) -> Contact:
+    erased = context.transition(contact, "erase", name=ERASED, email=None, phone=None)
+    context.erase(erased)
+    context.emit(ContactErased(contact_id=erased.id))
+    return erased
+
+
+def _erase_address(context: Context, address: Address) -> Address:
+    erased = context.transition(address, "erase", lines=(ERASED,))
+    context.erase(erased)
+    context.emit(AddressErased(address_id=erased.id))
+    return erased

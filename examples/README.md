@@ -7,12 +7,13 @@ also the test of whether Remit is genuinely general.
 Status: profiles only. The code arrives as the modules it needs are built (see
 [docs/modules-and-templates.md](../docs/modules-and-templates.md)).
 
-The companies are invented. Any resemblance to a real business is coincidental.
+The companies are invented. Some are modelled on kinds of business the authors have
+worked in, but none describes a real one, and every name, figure and detail is made up.
 
 | Company | Business model | Why it is here |
 |---|---|---|
 | [Fernhill Analytics](fernhill-analytics/) | B2B software sold by subscription | Revenue earned over time, not when invoiced; billing that runs itself |
-| [Kestrel Scientific](kestrel-scientific/) | Exports laboratory supplies, buying each order in | Documents that flow line by line from quote to air waybill; four currencies |
+| [Kestrel Animal Health](kestrel-animal-health/) | Exports veterinary diagnostics, buying each order in | Documents that flow line by line from quote to air waybill; four currencies |
 | [Orrin Cycles](orrin-cycles/) | Builds bicycles to order | Turning parts into products; what each bike really cost |
 | [Stallholder](stallholder/) | Online marketplace for independent makers | Most of the money it handles belongs to someone else |
 | [Riverbank Food Trust](riverbank-food-trust/) | Charity | Money that may only be spent on what it was given for; no profit |
@@ -35,7 +36,7 @@ only for what is particular to it. Its custom code lives in its own folder, outs
 | sales | ● | ● | ● | ● | |
 | purchasing | | ● | ● | | ● |
 | inventory | | ● | ● | | ● |
-| Custom modules | `subscriptions`, `metering` | `airfreight`, `pricefiles` | `workshop` | `marketplace` | `giving`, `grants` |
+| Custom modules | `subscriptions`, `metering` | `airfreight`, `pricelists` | `workshop` | `marketplace` | `giving`, `grants` |
 
 Custom modules that a second company turns out to need are promoted to standard ones.
 `subscriptions` is the first candidate: Fernhill bills plans monthly, and Riverbank takes

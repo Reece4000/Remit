@@ -12,16 +12,18 @@ from .errors import (
     RemitError,
     Unauthorised,
 )
-from .fields import Code, Country, Name
+from .fields import Code, Country, Name, UnitCode, unit_name
 from .kernel import DeliveryFailure, Dispatched, Kernel
 from .message import Command, Event, Outcome, Recorded
 from .module import Migration, Module
 from .money import Currency, Money, minor_units
+from .personal import ERASED, Personal
 from .postgres import PostgresStore
 from .registry import Registry
 from .store import AuditEntry, MemoryStore, Store, Unit
 
 __all__ = [
+    "ERASED",
     "Actor",
     "ActorKind",
     "AuditEntry",
@@ -45,6 +47,7 @@ __all__ = [
     "Name",
     "NotFound",
     "Outcome",
+    "Personal",
     "PostgresStore",
     "Reader",
     "Recorded",
@@ -56,5 +59,7 @@ __all__ = [
     "Transition",
     "Unauthorised",
     "Unit",
+    "UnitCode",
     "minor_units",
+    "unit_name",
 ]

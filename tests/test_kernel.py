@@ -3,6 +3,7 @@
 from uuid import UUID, uuid7
 
 import pytest
+from conftest import kernel_on
 from pydantic import ValidationError
 
 from remit.kernel import (
@@ -150,7 +151,7 @@ VISITOR = Actor(id="visitor", kind=ActorKind.HUMAN, permissions=frozenset({"desk
 
 @pytest.fixture
 def kernel(store: Store) -> Kernel:
-    return Kernel([desk], store=store)
+    return kernel_on(store, [desk])
 
 
 @pytest.fixture
@@ -388,7 +389,7 @@ def change_queue(command: ChangeQueue, context: Context) -> Queue:
 
 @pytest.fixture
 def routes(store: Store) -> Kernel:
-    return Kernel([routing], store=store)
+    return kernel_on(store, [routing])
 
 
 ROUTER = Actor(id="router", kind=ActorKind.HUMAN, permissions=frozenset({"routing.*"}))

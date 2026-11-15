@@ -5,6 +5,8 @@ transaction it cannot fit into a serial order; that surfaces here as `Concurrenc
 and the kernel runs the unit again.
 """
 
+import hashlib
+import json
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from importlib.resources import files
@@ -27,6 +29,10 @@ _SCHEMA = files(__package__).joinpath("schema.sql").read_bytes()
 _EVENT_ORDER_LOCK = 7_154_697_431
 
 _MAX_IDENTIFIER = 63  # PostgreSQL's NAMEDATALEN - 1, in bytes
+_UNIQUE_PREFIX = "unique "
+
+# A unique violation is retried because two units can race to claim the same value (an
+# idempotency key, a code): the retry then sees the winner and is refused or replayed.
 
 _UNSERIALISABLE = (errors.SerializationFailure, errors.DeadlockDetected, errors.UniqueViolation)
 
@@ -41,16 +47,16 @@ class PostgresStore:
         self._pool.open(wait=True, timeout=timeout)
 
     def install(self, modules: Iterable[Module] = ()) -> None:
-        """Create the kernel's tables, then each module's migrations and database rules.
+        """Create the kernel's tables, then each module's migrations, indexes and rules.
 
-        Modules are installed with everything they require, dependencies first.
+        Modules are installed with everything they require, dependencies first. Each is
+        recorded with a fingerprint of its storage declarations, so that a kernel can
+        refuse to run a module the store was not installed with.
         """
         with self._pool.connection() as connection:
             connection.execute(_SCHEMA)
             for module in installation_order(modules):
-                for kind, document in module.documents.items():
-                    for field in document.unique:
-                        connection.execute(_unique_index(kind, field))
+                _install_unique_indexes(connection, module)
                 for migration in module.migrations:
                     claimed = connection.execute(
                         "INSERT INTO migrations (module, name) VALUES (%s, %s) "
@@ -61,6 +67,31 @@ class PostgresStore:
                         connection.execute(migration.sql.encode())
                 if module.sql:
                     connection.execute(module.sql.encode())
+                connection.execute(
+                    "INSERT INTO installed_modules (module, fingerprint) VALUES (%s, %s) "
+                    "ON CONFLICT (module) DO UPDATE "
+                    "SET fingerprint = EXCLUDED.fingerprint, installed_at = now()",
+                    (module.name, fingerprint(module)),
+                )
+
+    def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
+        """Why this store cannot yet run these modules. Empty when it can."""
+        with self._pool.connection() as connection:
+            (ready,) = connection.execute(
+                "SELECT to_regclass('installed_modules') IS NOT NULL"
+            ).fetchone() or (False,)
+            if not ready:
+                return ("nothing has been installed in this database yet",)
+            installed = dict(
+                connection.execute("SELECT module, fingerprint FROM installed_modules").fetchall()
+            )
+        problems: list[str] = []
+        for module in modules:
+            if module.name not in installed:
+                problems.append(f"module {module.name!r} is not installed in this database")
+            elif installed[module.name] != fingerprint(module):
+                problems.append(f"module {module.name!r} was installed from a different definition")
+        return tuple(problems)
 
     def close(self) -> None:
         self._pool.close()
@@ -71,19 +102,59 @@ class PostgresStore:
             with self._pool.connection() as connection:
                 yield _PostgresUnit(connection)
         except _UNSERIALISABLE as conflict:
-            raise ConcurrencyError("the database could not serialise this unit of work") from (
-                conflict
-            )
+            constraint = conflict.diag.constraint_name
+            detail = f" (conflict on {constraint})" if constraint else ""
+            raise ConcurrencyError(
+                f"the database could not serialise this unit of work{detail}"
+            ) from conflict
 
 
-def _unique_index(kind: str, field: str) -> sql.Composed:
-    name = f"unique {kind}.{field}"
-    if len(name.encode()) > _MAX_IDENTIFIER:
-        raise RegistrationError(f"{kind}.{field} is too long a name to index; shorten it")
-    return sql.SQL(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON documents ((body ->> {field})) "
-        "WHERE kind = {kind}"
-    ).format(name=sql.Identifier(name), field=sql.Literal(field), kind=sql.Literal(kind))
+def fingerprint(module: Module) -> str:
+    """A digest of everything about a module that installing it puts in the database."""
+    declared = {
+        "migrations": [(migration.name, migration.sql) for migration in module.migrations],
+        "sql": module.sql,
+        "unique": sorted(_unique_indexes(module)),
+    }
+    return hashlib.sha256(json.dumps(declared, sort_keys=True).encode()).hexdigest()
+
+
+def _unique_indexes(module: Module) -> dict[str, tuple[str, str]]:
+    """Index name to (document kind, field), for every unique field the module declares."""
+    indexes: dict[str, tuple[str, str]] = {}
+    for kind, document in module.documents.items():
+        for field in document.unique:
+            name = f"{_UNIQUE_PREFIX}{kind}.{field}"
+            if len(name.encode()) > _MAX_IDENTIFIER:
+                raise RegistrationError(f"{kind}.{field} is too long a name to index; shorten it")
+            indexes[name] = (kind, field)
+    return indexes
+
+
+def _install_unique_indexes(connection: Connection[Any], module: Module) -> None:
+    """Create the module's unique indexes, and drop any for fields no longer unique.
+
+    A stale index would go on refusing values the module now allows, and its violations
+    would look like contention rather than a rule.
+    """
+    declared = _unique_indexes(module)
+    ours = f"{_UNIQUE_PREFIX}{module.name}."
+    existing = {
+        name
+        for (name,) in connection.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'documents'"
+        ).fetchall()
+        if name.startswith(ours)
+    }
+    for name in sorted(existing - declared.keys()):
+        connection.execute(sql.SQL("DROP INDEX {name}").format(name=sql.Identifier(name)))
+    for name, (kind, field) in declared.items():
+        connection.execute(
+            sql.SQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON documents ((body ->> {field})) "
+                "WHERE kind = {kind}"
+            ).format(name=sql.Identifier(name), field=sql.Literal(field), kind=sql.Literal(kind))
+        )
 
 
 def _serialisable(connection: Connection[Any]) -> None:
@@ -132,9 +203,15 @@ class _PostgresUnit:
         ).fetchone()
         return cast(Json, row[0]) if row else None
 
+    def secret(self, key: UUID) -> bytes | None:
+        row = self._connection.execute(
+            "SELECT secret FROM data_keys WHERE id = %s", (key,)
+        ).fetchone()
+        return bytes(row[0]) if row else None
+
     def audit(self) -> list[AuditEntry]:
         rows = self._connection.execute(
-            "SELECT at, actor, action, input, documents, events, cause FROM audit ORDER BY id"
+            "SELECT at, actor, action, input, documents, events, cause, key FROM audit ORDER BY id"
         ).fetchall()
         return [
             AuditEntry(
@@ -145,8 +222,9 @@ class _PostgresUnit:
                 documents=tuple((kind, UUID(id), version) for kind, id, version in documents),
                 events=tuple(events),
                 cause=cause,
+                key=key,
             )
-            for at, actor, action, input, documents, events, cause in rows
+            for at, actor, action, input, documents, events, cause, key in rows
         ]
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
@@ -184,9 +262,24 @@ class _PostgresUnit:
                     "INSERT INTO events (name, body, at, actor) VALUES (%s, %s, %s, %s)",
                     (name, Jsonb(body), audit.at, audit.actor.id),
                 )
+        for data_key in commit.keys:
+            execute(
+                "INSERT INTO data_keys (id, secret) VALUES (%s, %s)", (data_key.id, data_key.secret)
+            )
+            for subject in data_key.subjects:
+                execute(
+                    "INSERT INTO data_key_subjects (key_id, subject) VALUES (%s, %s)",
+                    (data_key.id, subject),
+                )
+        if commit.erasures:
+            execute(
+                "DELETE FROM data_keys WHERE id IN "
+                "(SELECT key_id FROM data_key_subjects WHERE subject = ANY(%s))",
+                (list(commit.erasures),),
+            )
         execute(
-            "INSERT INTO audit (at, actor, action, input, documents, events, cause) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO audit (at, actor, action, input, documents, events, cause, key) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 audit.at,
                 Jsonb(audit.actor.model_dump(mode="json")),
@@ -195,6 +288,7 @@ class _PostgresUnit:
                 Jsonb([[kind, str(id), version] for kind, id, version in audit.documents]),
                 Jsonb(list(audit.events)),
                 audit.cause,
+                audit.key,
             ),
         )
         if commit.cursor:

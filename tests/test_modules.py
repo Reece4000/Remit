@@ -6,7 +6,8 @@ from uuid import UUID
 
 import psycopg
 import pytest
-from conftest import DSN
+from conftest import DSN, kernel_on
+from psycopg.conninfo import make_conninfo
 from pydantic import BaseModel
 
 from remit.kernel import (
@@ -113,7 +114,7 @@ def test_a_dependency_needs_its_settings_even_when_only_its_dependent_is_named()
 
 
 def test_a_module_reacts_to_events_of_the_modules_it_requires(store: Store) -> None:
-    kernel = Kernel([shop], store=store)
+    kernel = kernel_on(store, [shop])
     product = kernel.execute(ListProduct(name="Kettle"), actor=ADMIN).result
     assert kernel.dispatch().delivered == 1
     assert [label.product_id for label in kernel.find(ShelfLabel)] == [product.id]
@@ -199,3 +200,87 @@ def test_a_unique_field_whose_index_name_postgres_would_truncate_is_refused(
 
     with pytest.raises(RegistrationError, match="too long a name to index"):
         installed_postgres.install([verbose])
+
+
+# A kernel runs only modules its store was installed with, as they are now declared.
+
+
+def registry_module(*, unique: tuple[str, ...]) -> Module:
+    """A fresh definition of one module, with or without a unique field."""
+    registry = Module("test_registry")
+
+    @registry.document
+    class Entry(Document):
+        """An entry in a register."""
+
+        lifecycle = Lifecycle(initial="entered")
+
+        number: str
+
+    Entry.unique = unique
+    return registry
+
+
+@pytest.fixture
+def fresh_registry(installed_postgres: PostgresStore) -> Iterator[PostgresStore]:
+    def forget() -> None:
+        with psycopg.connect(DSN) as connection:
+            connection.execute("DELETE FROM installed_modules WHERE module = 'test_registry'")
+            connection.execute('DROP INDEX IF EXISTS "unique test_registry.entry.number"')
+
+    forget()
+    yield installed_postgres
+    forget()
+
+
+def indexes_on_documents() -> set[str]:
+    with psycopg.connect(DSN) as connection:
+        rows = connection.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'documents'"
+        ).fetchall()
+    return {name for (name,) in rows}
+
+
+def test_a_kernel_refuses_modules_its_store_was_not_installed_with(
+    fresh_registry: PostgresStore,
+) -> None:
+    with pytest.raises(RegistrationError, match="'test_registry' is not installed"):
+        Kernel([registry_module(unique=("number",))], store=fresh_registry)
+
+
+def test_a_kernel_refuses_a_module_whose_definition_changed_since_install(
+    fresh_registry: PostgresStore,
+) -> None:
+    fresh_registry.install([registry_module(unique=())])
+    changed = registry_module(unique=("number",))
+
+    with pytest.raises(RegistrationError, match="installed from a different definition"):
+        Kernel([changed], store=fresh_registry)
+
+    fresh_registry.install([changed])
+    Kernel([changed], store=fresh_registry)
+
+
+def test_installing_drops_the_index_of_a_field_that_is_no_longer_unique(
+    fresh_registry: PostgresStore,
+) -> None:
+    fresh_registry.install([registry_module(unique=("number",))])
+    assert "unique test_registry.entry.number" in indexes_on_documents()
+
+    fresh_registry.install([registry_module(unique=())])
+    assert "unique test_registry.entry.number" not in indexes_on_documents()
+
+
+def test_a_kernel_on_a_database_never_installed_says_so(installed_postgres: PostgresStore) -> None:
+    fresh = "remit_test_fresh"
+    with psycopg.connect(DSN, autocommit=True) as connection:
+        connection.execute(f"DROP DATABASE IF EXISTS {fresh}")
+        connection.execute(f"CREATE DATABASE {fresh}")
+    store = PostgresStore(make_conninfo(DSN, dbname=fresh), timeout=3)
+    try:
+        with pytest.raises(RegistrationError, match="nothing has been installed"):
+            Kernel([catalogue], store=store)
+    finally:
+        store.close()
+        with psycopg.connect(DSN, autocommit=True) as connection:
+            connection.execute(f"DROP DATABASE {fresh}")

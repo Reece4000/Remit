@@ -6,21 +6,33 @@ import pytest
 from pydantic import ValidationError
 
 from remit import parties
-from remit.kernel import Actor, ActorKind, Kernel, NotFound, Rejected, Store, Unauthorised
+from remit.kernel import (
+    ERASED,
+    Actor,
+    ActorKind,
+    Kernel,
+    NotFound,
+    Rejected,
+    Store,
+    Unauthorised,
+)
 from remit.parties import (
-    Address,
+    AddAddress,
+    AddContact,
+    AmendContact,
     AmendParty,
     ArchiveParty,
     Contact,
+    EraseContact,
+    EraseParty,
     Party,
     PartyKind,
     RegisterParty,
+    RemoveContact,
     RestoreParty,
 )
 
 CLERK = Actor(id="clerk", kind=ActorKind.HUMAN, permissions=frozenset({"parties.*"}))
-NAIROBI = Address(label="Delivery", lines=("University Way", "Nairobi"), country="KE")
-LAB_MANAGER = Contact(name="Wanjiru Kamau", role="Lab manager", email="w.kamau@example.ac.ke")
 
 
 @pytest.fixture
@@ -30,38 +42,51 @@ def kernel(store: Store) -> Kernel:
 
 def register(kernel: Kernel, code: str = "C0001", **details: object) -> Party:
     command = RegisterParty.model_validate(
-        {"code": code, "kind": PartyKind.ORGANISATION, "name": "Highland University", **details}
+        {"code": code, "kind": PartyKind.ORGANISATION, "name": "Harbour Cooperative", **details}
+    )
+    return kernel.execute(command, actor=CLERK).result
+
+
+def add_contact(
+    kernel: Kernel, party: Party, name: str = "Sanne de Vries", **details: object
+) -> Contact:
+    command = AddContact.model_validate({"party_id": party.id, "name": name, **details})
+    return kernel.execute(command, actor=CLERK).result
+
+
+def add_address(kernel: Kernel, party: Party, *lines: str, country: str = "NL") -> parties.Address:
+    command = AddAddress(
+        party_id=party.id,
+        label="Delivery",
+        lines=lines or ("Kade 12", "Rotterdam"),
+        country=country,
     )
     return kernel.execute(command, actor=CLERK).result
 
 
 def amend(kernel: Kernel, party: Party, **details: object) -> Party:
-    current = {
-        field: getattr(party, field) for field in ("name", "tax_number", "addresses", "contacts")
-    }
+    current = {"name": party.name, "tax_number": party.tax_number}
     command = AmendParty.model_validate(
         {"party_id": party.id, "version": party.version, **current, **details}
     )
     return kernel.execute(command, actor=CLERK).result
 
 
-def test_a_party_is_registered_with_its_addresses_and_contacts(kernel: Kernel) -> None:
+def test_a_party_is_registered_and_found_by_code_or_kind(kernel: Kernel) -> None:
     outcome = kernel.execute(
         RegisterParty(
             code="C0001",
             kind=PartyKind.ORGANISATION,
-            name="  Highland University ",
-            tax_number="KE-P051234567X",
-            addresses=(NAIROBI,),
-            contacts=(LAB_MANAGER,),
+            name="  Harbour Cooperative ",
+            tax_number="NL123456789B01",
         ),
         actor=CLERK,
     )
 
     registered = outcome.result
-    assert (registered.state, registered.name) == ("active", "Highland University")
+    assert (registered.state, registered.name) == ("active", "Harbour Cooperative")
     assert parties.party(kernel, "C0001") == registered
-    assert kernel.get(Party, registered.id).contacts == (LAB_MANAGER,)
+    assert kernel.find(Party, kind=PartyKind.ORGANISATION) == [registered]
     assert outcome.events == (parties.PartyRegistered(party_id=registered.id, code="C0001"),)
 
 
@@ -70,7 +95,7 @@ def test_codes_are_never_shared_even_with_an_archived_party(kernel: Kernel) -> N
     kernel.execute(ArchiveParty(party_id=first.id), actor=CLERK)
 
     with pytest.raises(Rejected, match="party code 'C0001' is already in use"):
-        register(kernel, name="Another University")
+        register(kernel, name="Another Cooperative")
     assert len(kernel.find(Party)) == 1
 
 
@@ -83,69 +108,53 @@ def test_codes_are_never_shared_even_with_an_archived_party(kernel: Kernel) -> N
         {"code": "C" * 33},
         {"name": "   "},
         {"kind": "company"},
-        {"contacts": [{"name": "Wanjiru", "email": "not an address"}]},
-        {"addresses": [{"label": "Delivery", "lines": ["Nairobi"], "country": "Kenya"}]},
-        {"addresses": [{"label": "Delivery", "lines": [], "country": "KE"}]},
-        {"addresses": [{"label": "Delivery", "lines": ["London"], "country": "UK"}]},
-        {"addresses": [{"label": "Delivery", "lines": ["Nowhere"], "country": "ZZ"}]},
+        {"contacts": []},
     ],
 )
 def test_details_that_cannot_be_right_are_refused(details: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         RegisterParty.model_validate(
-            {"code": "C0001", "kind": "organisation", "name": "Highland University", **details}
+            {"code": "C0001", "kind": "organisation", "name": "Harbour Cooperative", **details}
         )
 
 
 def test_amending_replaces_the_details_and_says_what_changed(kernel: Kernel) -> None:
-    party = register(kernel, tax_number="KE-P051234567X", contacts=(LAB_MANAGER,))
+    party = register(kernel, tax_number="NL123456789B01")
 
     outcome = kernel.execute(
-        AmendParty(
-            party_id=party.id,
-            version=party.version,
-            name="Highland University (HU)",
-            tax_number=None,
-            addresses=(),
-            contacts=(),
-        ),
+        AmendParty(party_id=party.id, version=party.version, name="Harbour Coop", tax_number=None),
         actor=CLERK,
     )
 
     amended = outcome.result
-    assert (amended.name, amended.tax_number, amended.contacts) == (
-        "Highland University (HU)",
-        None,
-        (),
-    )
-    assert (amended.code, amended.kind, amended.version) == (party.code, party.kind, 2)
+    assert (amended.name, amended.tax_number, amended.version) == ("Harbour Coop", None, 2)
+    assert (amended.code, amended.kind) == (party.code, party.kind)
     assert outcome.events == (
-        parties.PartyAmended(party_id=party.id, changed=("name", "tax_number", "contacts")),
+        parties.PartyAmended(party_id=party.id, changed=("name", "tax_number")),
     )
 
 
 def test_an_amendment_must_give_every_detail_so_none_is_cleared_by_omission() -> None:
     with pytest.raises(ValidationError) as refused:
         AmendParty.model_validate({"party_id": uuid7(), "version": 1, "name": "Renamed"})
-    missing = {
-        tuple(error["loc"]) for error in refused.value.errors() if error["type"] == "missing"
+    errors = refused.value.errors()
+    assert {tuple(error["loc"]) for error in errors if error["type"] == "missing"} == {
+        ("tax_number",)
     }
-    assert missing == {("tax_number",), ("addresses",), ("contacts",)}
 
 
 def test_an_amendment_from_an_out_of_date_copy_is_refused(kernel: Kernel) -> None:
     party = register(kernel)
-    amend(kernel, party, name="Highland University (HU)")
+    amend(kernel, party, name="Harbour Coop")
 
     with pytest.raises(Rejected, match="has changed since version 1"):
-        amend(kernel, party, addresses=(NAIROBI,))
-    assert parties.party(kernel, "C0001").addresses == ()
+        amend(kernel, party, tax_number="NL123456789B01")
+    assert parties.party(kernel, "C0001").tax_number is None
 
 
 def test_an_amendment_that_changes_nothing_is_refused(kernel: Kernel) -> None:
-    party = register(kernel)
     with pytest.raises(Rejected, match="nothing would change"):
-        amend(kernel, party)
+        amend(kernel, register(kernel))
 
 
 def test_the_code_and_kind_cannot_be_amended(kernel: Kernel) -> None:
@@ -155,25 +164,120 @@ def test_the_code_and_kind_cannot_be_amended(kernel: Kernel) -> None:
             amend(kernel, party, **fixed)
 
 
-def test_an_archived_party_must_be_restored_before_it_is_amended(kernel: Kernel) -> None:
+def test_an_archived_party_must_be_restored_before_it_changes(kernel: Kernel) -> None:
     party = register(kernel)
     archived = kernel.execute(ArchiveParty(party_id=party.id), actor=CLERK).result
 
-    with pytest.raises(Rejected, match="archived; restore it before amending it"):
-        amend(kernel, archived, name="Highland University (HU)")
-    with pytest.raises(
-        Rejected, match="cannot archive from state 'archived'; allowed here: restore"
-    ):
+    with pytest.raises(Rejected, match="party C0001 is archived; it cannot be changed"):
+        amend(kernel, archived, name="Harbour Coop")
+    with pytest.raises(Rejected, match="party C0001 is archived"):
+        add_contact(kernel, archived)
+    with pytest.raises(Rejected, match="cannot archive from state 'archived'; allowed here: "):
         kernel.execute(ArchiveParty(party_id=party.id), actor=CLERK)
 
     restored = kernel.execute(RestoreParty(party_id=party.id), actor=CLERK).result
-    assert amend(kernel, restored, name="Highland University (HU)").state == "active"
-    assert [type(recorded.event) for recorded in kernel.events()] == [
-        parties.PartyRegistered,
-        parties.PartyArchived,
-        parties.PartyRestored,
-        parties.PartyAmended,
+    assert amend(kernel, restored, name="Harbour Coop").state == "active"
+
+
+def test_contacts_and_addresses_are_kept_beside_the_party(kernel: Kernel) -> None:
+    party = register(kernel)
+    sanne = add_contact(kernel, party, role="Purchasing", email="Sanne@Example.NL")
+    pieter = add_contact(kernel, party, "Pieter Bakker")
+    delivery = add_address(kernel, party)
+
+    assert parties.contacts(kernel, party.id) == [sanne, pieter]
+    assert sanne.email == "Sanne@example.nl"
+    assert parties.addresses(kernel, party.id) == [delivery]
+    assert kernel.get(Party, party.id).version == 1, "adding details does not change the party"
+
+    kernel.execute(RemoveContact(contact_id=pieter.id), actor=CLERK)
+    assert parties.contacts(kernel, party.id) == [sanne]
+
+
+def test_two_contacts_can_be_amended_from_the_same_reading_of_the_party(kernel: Kernel) -> None:
+    party = register(kernel)
+    sanne, pieter = add_contact(kernel, party), add_contact(kernel, party, "Pieter Bakker")
+
+    for contact, email in ((sanne, "sanne@example.nl"), (pieter, "pieter@example.nl")):
+        kernel.execute(
+            AmendContact(
+                contact_id=contact.id,
+                version=contact.version,
+                name=contact.name,
+                role=None,
+                email=email,
+                phone=None,
+            ),
+            actor=CLERK,
+        )
+    assert [c.email for c in parties.contacts(kernel, party.id)] == [
+        "sanne@example.nl",
+        "pieter@example.nl",
     ]
+
+
+@pytest.mark.parametrize(
+    ("lines", "country"),
+    [(("Kade 12",), "UK"), (("Kade 12",), "ZZ"), (("Kade 12",), "nl"), ((), "NL")],
+)
+def test_addresses_need_lines_and_an_assigned_country_code(
+    lines: tuple[str, ...], country: str
+) -> None:
+    with pytest.raises(ValidationError):
+        AddAddress(party_id=uuid7(), label="Delivery", lines=lines, country=country)
+
+
+def test_a_contact_needs_a_real_email_address() -> None:
+    with pytest.raises(ValidationError):
+        AddContact(party_id=uuid7(), name="Sanne", email="not an address")
+
+
+def test_erasing_a_contact_leaves_the_rest_of_the_party(kernel: Kernel) -> None:
+    party = register(kernel)
+    sanne = add_contact(kernel, party, role="Purchasing", email="sanne@example.nl")
+    pieter = add_contact(kernel, party, "Pieter Bakker")
+
+    outcome = kernel.execute(EraseContact(contact_id=sanne.id), actor=CLERK)
+
+    erased = outcome.result
+    assert (erased.state, erased.name, erased.email, erased.role) == (
+        "erased",
+        ERASED,
+        None,
+        "Purchasing",
+    )
+    assert outcome.events == (parties.ContactErased(contact_id=sanne.id),)
+    assert parties.contacts(kernel, party.id) == [pieter]
+    added = [entry.input for entry in kernel.audit() if entry.action == "parties.add_contact"]
+    assert [entry["name"] for entry in added] == [ERASED, "Pieter Bakker"]
+    with pytest.raises(Rejected, match="cannot erase from state 'erased'"):
+        kernel.execute(EraseContact(contact_id=sanne.id), actor=CLERK)
+
+
+def test_erasing_a_person_erases_their_contacts_and_addresses(kernel: Kernel) -> None:
+    amy = register(kernel, "P0001", kind=PartyKind.PERSON, name="Amy Shaw", tax_number="AB123456C")
+    add_contact(kernel, amy, "Amy Shaw", email="amy@example.com")
+    add_address(kernel, amy, "1 Mill Lane", "York", country="GB")
+
+    erased = kernel.execute(EraseParty(party_id=amy.id), actor=CLERK).result
+
+    assert (erased.state, erased.code, erased.name, erased.tax_number) == (
+        "erased",
+        "P0001",
+        ERASED,
+        None,
+    )
+    assert [c.state for c in kernel.find(Contact, party_id=amy.id)] == ["erased"]
+    assert [a.lines for a in kernel.find(parties.Address, party_id=amy.id)] == [(ERASED,)]
+    kept = " ".join(str(entry.input) for entry in kernel.audit())
+    for personal in ("Amy Shaw", "AB123456C", "amy@example.com", "Mill Lane"):
+        assert personal not in kept
+
+
+def test_an_organisation_is_not_a_person_to_erase(kernel: Kernel) -> None:
+    party = register(kernel)
+    with pytest.raises(Rejected, match="is an organisation, not a person; erase its contacts"):
+        kernel.execute(EraseParty(party_id=party.id), actor=CLERK)
 
 
 def test_looking_up_a_code_that_does_not_exist_says_so(kernel: Kernel) -> None:
@@ -188,13 +292,91 @@ def test_registering_does_not_grant_amending(kernel: Kernel) -> None:
     )
     with pytest.raises(Unauthorised, match=r"parties\.amend_party"):
         kernel.execute(
-            AmendParty(
-                party_id=party.id,
-                version=party.version,
-                name="Mine now",
-                tax_number=None,
-                addresses=(),
-                contacts=(),
-            ),
+            AmendParty(party_id=party.id, version=party.version, name="Mine", tax_number=None),
             actor=registrar,
         )
+
+
+def test_addresses_are_amended_removed_and_erased_on_their_own(kernel: Kernel) -> None:
+    party = register(kernel)
+    delivery = add_address(kernel, party)
+    billing = add_address(kernel, party, "Postbus 3", "Rotterdam")
+
+    moved = kernel.execute(
+        parties.AmendAddress(
+            address_id=delivery.id,
+            version=delivery.version,
+            label="Delivery",
+            lines=("Kade 14", "Rotterdam"),
+            country="NL",
+        ),
+        actor=CLERK,
+    )
+    assert moved.events == (parties.AddressAmended(address_id=delivery.id, changed=("lines",)),)
+
+    kernel.execute(parties.RemoveAddress(address_id=billing.id), actor=CLERK)
+    erased = kernel.execute(parties.EraseAddress(address_id=billing.id), actor=CLERK).result
+
+    assert (erased.state, erased.lines, erased.country) == ("erased", (ERASED,), "NL")
+    assert parties.addresses(kernel, party.id) == [moved.result]
+
+
+def test_a_removed_contact_cannot_be_amended_but_can_be_erased(kernel: Kernel) -> None:
+    party = register(kernel)
+    sanne = add_contact(kernel, party)
+    removed = kernel.execute(RemoveContact(contact_id=sanne.id), actor=CLERK).result
+
+    with pytest.raises(Rejected, match="this contact is removed; it cannot be changed"):
+        kernel.execute(
+            AmendContact(
+                contact_id=sanne.id,
+                version=removed.version,
+                name="Sanne",
+                role=None,
+                email=None,
+                phone=None,
+            ),
+            actor=CLERK,
+        )
+    assert kernel.execute(EraseContact(contact_id=sanne.id), actor=CLERK).result.state == "erased"
+
+
+def test_erasing_a_person_skips_details_already_erased(kernel: Kernel) -> None:
+    amy = register(kernel, "P0001", kind=PartyKind.PERSON, name="Amy Shaw")
+    contact = add_contact(kernel, amy, "Amy Shaw")
+    address = add_address(kernel, amy, "1 Mill Lane", country="GB")
+    kernel.execute(EraseContact(contact_id=contact.id), actor=CLERK)
+    kernel.execute(parties.EraseAddress(address_id=address.id), actor=CLERK)
+
+    assert kernel.execute(EraseParty(party_id=amy.id), actor=CLERK).result.state == "erased"
+
+
+def test_the_details_of_an_archived_party_cannot_change_but_can_be_erased(kernel: Kernel) -> None:
+    party = register(kernel)
+    sanne = add_contact(kernel, party)
+    delivery = add_address(kernel, party)
+    kernel.execute(ArchiveParty(party_id=party.id), actor=CLERK)
+
+    refusals = [
+        AmendContact(
+            contact_id=sanne.id,
+            version=sanne.version,
+            name="Sanne",
+            role=None,
+            email=None,
+            phone=None,
+        ),
+        RemoveContact(contact_id=sanne.id),
+        parties.AmendAddress(
+            address_id=delivery.id,
+            version=delivery.version,
+            label="Delivery",
+            lines=("Kade 14",),
+            country="NL",
+        ),
+        parties.RemoveAddress(address_id=delivery.id),
+    ]
+    for command in refusals:
+        with pytest.raises(Rejected, match="party C0001 is archived; it cannot be changed"):
+            kernel.execute(command, actor=CLERK)
+    assert kernel.execute(EraseContact(contact_id=sanne.id), actor=CLERK).result.state == "erased"

@@ -22,7 +22,7 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
-from remit.kernel import Document, Money, module, postgres, registry
+from remit.kernel import Document, Money, module, personal, postgres, registry
 from remit.kernel.context import Context
 from remit.ledger import books, commands
 
@@ -30,6 +30,7 @@ KERNEL = ["tests/test_kernel.py"]
 MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
 STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
+PERSONAL = ["tests/test_personal.py", "tests/test_parties.py"]
 RACES = ["tests/test_postgres.py"]
 RACE_RUNS = 20
 
@@ -81,6 +82,16 @@ MUTATIONS = [
         swap(Context, "_require_unique", nothing),
     ),
     Mutation(
+        "personal data is kept unsealed",
+        PERSONAL,
+        swap(personal.DataKey, "seal", lambda self, value: value),
+    ),
+    Mutation(
+        "erasure leaves the keys in place",
+        PERSONAL,
+        swap(Context, "erasures", property(lambda _: ())),
+    ),
+    Mutation(
         "modules are registered before their dependencies",
         MODULES,
         swap(registry, "installation_order", dependents_first),
@@ -89,6 +100,11 @@ MUTATIONS = [
         "modules are installed before their dependencies",
         MODULES,
         swap(postgres, "installation_order", dependents_first),
+    ),
+    Mutation(
+        "kernels run modules their database was not installed with",
+        MODULES,
+        swap(postgres.PostgresStore, "missing", lambda *_: ()),
     ),
     Mutation(
         "modules react to events of modules they do not require",
@@ -157,7 +173,12 @@ MUTATIONS = [
 
 def passes(tests: Sequence[str]) -> bool:
     """Run tests quietly in this process, stopping at the first failure."""
-    arguments = ["-q", "-x", "--tb=no", "--no-header", "-p", "no:cacheprovider", *tests]
+    arguments = [
+        *("-q", "-x", "--tb=no", "--no-header", "-p", "no:cacheprovider"),
+        # Running pytest again in one process re-imports its plugins; that is expected here.
+        *("-W", "ignore::pytest.PytestAssertRewriteWarning"),
+        *tests,
+    ]
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):
         return pytest.main(arguments) == 0
 
@@ -167,7 +188,7 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *MODULES, *LEDGER, *STANDARD, *RACES]):
+    if not passes([*KERNEL, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *RACES]):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")
