@@ -28,13 +28,17 @@ from remit.kernel import (
     Module,
     Name,
     Personal,
+    SingleLine,
     Transition,
 )
 
 module = Module("parties")
 
-Line = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-TaxNumber = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+Line = Name
+"""One line of an address, or a phone number as written."""
+TaxNumber = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40), SingleLine
+]
 
 
 class PartyKind(StrEnum):

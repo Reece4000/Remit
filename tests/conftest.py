@@ -28,14 +28,27 @@ def kernel_on(store: Store, modules: Sequence[Module], **options: Any) -> Kernel
     return Kernel(modules, store=store, **options)
 
 
+RECORDS = (
+    "documents, events, audit, cursors, idempotency, data_keys, data_key_subjects, "
+    "ledger_books, pgledger_idempotency_keys, pgledger_entries, pgledger_transfers, "
+    "pgledger_accounts"
+)
+
+
 def empty_database() -> None:
+    """Empty every table of record between tests.
+
+    The database refuses TRUNCATE on these tables, as it must in production. A test
+    database is the one place they may be emptied, so its owner switches those triggers
+    off for the length of one transaction, which turns them back on when it commits.
+    """
     with psycopg.connect(DSN) as connection:
-        connection.execute(
-            "TRUNCATE documents, events, audit, cursors, idempotency, data_keys, "
-            "data_key_subjects, ledger_books, "
-            "pgledger_idempotency_keys, pgledger_entries, pgledger_transfers, pgledger_accounts "
-            "RESTART IDENTITY"
-        )
+        tables = [table.strip() for table in RECORDS.split(",")]
+        for table in tables:
+            connection.execute(f"ALTER TABLE {table} DISABLE TRIGGER never_truncated".encode())
+        connection.execute(f"TRUNCATE {RECORDS} RESTART IDENTITY".encode())
+        for table in tables:
+            connection.execute(f"ALTER TABLE {table} ENABLE TRIGGER never_truncated".encode())
 
 
 @pytest.fixture(scope="session")

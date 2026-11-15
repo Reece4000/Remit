@@ -5,16 +5,13 @@ belongs to the modules concerned, which refer to the item by id.
 """
 
 from enum import StrEnum
-from typing import Annotated
 from uuid import UUID
 
-from pydantic import StringConstraints
-
-from remit.kernel import Code, Document, Event, Lifecycle, Module, Name, Transition, UnitCode
+from remit.kernel import Code, Document, Event, Lifecycle, Module, Name, Text, Transition, UnitCode
 
 module = Module("items")
 
-Description = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Description = Text
 
 
 class ItemKind(StrEnum):

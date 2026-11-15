@@ -3,7 +3,8 @@
 Exercised through a toy module; see docs/personal-data.md for the design.
 """
 
-from typing import Annotated, Optional
+from dataclasses import dataclass
+from typing import Annotated, Optional, TypedDict
 from uuid import UUID
 
 import pytest
@@ -79,14 +80,6 @@ class ForgetNameOnly(Command[Member]):
     member_id: UUID
 
 
-class Directory(Command[dict[str, Member]]):
-    name: Annotated[str, Personal]
-
-
-class Households(Command[dict[str, tuple[Member, ...]]]):
-    name: Annotated[str, Personal]
-
-
 class Count(Command[dict[str, int]]):
     name: Annotated[str, Personal]
 
@@ -101,6 +94,10 @@ class Forget(Command[Member]):
 
 
 class ForgetWithoutBlanking(Command[None]):
+    member_id: UUID
+
+
+class ForgetThenRemember(Command[Member]):
     member_id: UUID
 
 
@@ -140,12 +137,6 @@ def forget_name_only(command: ForgetNameOnly, context: Context) -> Member:
 
 
 @people.command
-def households(command: Households, context: Context) -> dict[str, tuple[Member, ...]]:
-    """Join, and return the member under their household."""
-    return {"Shaw": (context.create(Member(name=command.name)),)}
-
-
-@people.command
 def count(command: Count, context: Context) -> dict[str, int]:
     """Join, and return how many members have joined under each grade."""
     context.create(Member(name=command.name))
@@ -153,9 +144,13 @@ def count(command: Count, context: Context) -> dict[str, int]:
 
 
 @people.command
-def directory(command: Directory, context: Context) -> dict[str, Member]:
-    """Join, and return the member keyed by name."""
-    return {command.name: context.create(Member(name=command.name))}
+def forget_then_remember(command: ForgetThenRemember, context: Context) -> Member:
+    """Blank and erase a member without ending their membership, then write their email
+    back before the unit commits."""
+    member = context.get(Member, command.member_id)
+    blanked = context.update(member, name=ERASED, email=None)
+    context.erase(blanked)
+    return context.update(blanked, email="amy@example.com")
 
 
 @people.command
@@ -341,13 +336,46 @@ def test_a_tuple_of_results_is_sealed_for_replay(club: Kernel) -> None:
     assert club.execute(together, actor=SECRETARY, idempotency_key="pair").result == first
 
 
-@pytest.mark.parametrize("command", [Directory(name="Amy"), Households(name="Amy")])
-def test_a_result_that_would_hide_personal_data_in_a_mapping_is_refused(
-    club: Kernel, command: Command[object]
+@dataclass(frozen=True)
+class Welcome:
+    member: Member
+    message: str
+
+
+class Card(TypedDict):
+    member: Member
+
+
+@pytest.mark.parametrize(
+    ("returns", "reason"),
+    [
+        (dict[str, Member], "holds personal data inside a dict"),
+        (dict[str, tuple[Member, ...]], "holds personal data inside a dict"),
+        (frozenset[Member], "holds personal data inside a frozenset"),
+        (Welcome, "holds personal data inside a Welcome"),
+        (Card, "holds personal data inside a Card"),
+        (tuple[Welcome, ...], "holds personal data inside a Welcome"),
+        (Annotated[str, Personal], "is marked personal itself"),
+    ],
+)
+def test_a_result_that_would_hide_personal_data_where_it_cannot_be_sealed_is_refused(
+    returns: object, reason: str
 ) -> None:
-    with pytest.raises(TypeError, match="inside a mapping cannot be sealed"):
-        club.execute(command, actor=SECRETARY, idempotency_key="mapping")
-    assert club.audit() == []
+    """What a command returns is kept for replay. Sealing follows models, tuples and
+    lists; anything else carrying personal data would be stored in the clear."""
+    lobby = Module("lobby", requires=(people,))
+
+    class Greet(Command[object]):
+        name: Annotated[str, Personal]
+
+    def greet(command: Greet, context: Context) -> None:
+        """Greet a member."""
+
+    greet.__annotations__["return"] = returns
+    lobby.command(greet)
+
+    with pytest.raises(RegistrationError, match=rf"lobby\.greet: what it returns {reason}"):
+        Kernel([lobby])
 
 
 def test_a_mapping_without_personal_data_is_kept_for_replay(club: Kernel) -> None:
@@ -426,3 +454,13 @@ def test_a_mark_on_part_of_a_type_is_refused_not_ignored(annotation: object) -> 
 
     with pytest.raises(RegistrationError, match="marks part of its type as personal"):
         Kernel([partial])
+
+
+def test_an_erased_document_must_hold_nothing_personal_when_the_unit_commits(
+    club: Kernel,
+) -> None:
+    amy = club.execute(Join(name="Amy", email="amy@example.com"), actor=SECRETARY).result
+
+    with pytest.raises(RemitError, match=r"replace people\.member's personal fields"):
+        club.execute(ForgetThenRemember(member_id=amy.id), actor=SECRETARY)
+    assert club.get(Member, amy.id) == amy

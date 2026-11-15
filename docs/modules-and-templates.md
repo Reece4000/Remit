@@ -29,6 +29,18 @@ A module declares documents, events, commands and subscriptions (as now), plus:
   requires directly, which the registry checks at startup. It imports `remit.kernel`
   and the top-level package of each dependency, and nothing deeper, which
   `tests/test_architecture.py` checks.
+- **Ownership.** A module writes only the documents it declares and emits only its own
+  events; the kernel refuses anything else. To change another module's documents it
+  executes one of that module's commands, which it may do only for its own commands and
+  those of modules it requires. So a custom module cannot get round a standard module's
+  rules (the ledger's balance, a code that never changes) by writing its documents
+  directly. `context.sql` is not yet held to this; see the README.
+- **Stable names.** Documents, events and commands are named after their classes, and
+  subscriptions after their handlers, prefixed with the module's name. Stored documents,
+  permissions and each subscription's place in the event log are kept under those
+  names, so renaming one is a migration, not a refactor. A subscription can be given a
+  fixed name, `@module.subscribe(Event, name="notify")`, so that its handler can be
+  renamed freely.
 - **Extensions to other modules' documents.** A module can add fields to a document it
   does not own. For example, a warranty module adds a warranty period to an item. The
   owning module doesn't know about the extension, and the extension is namespaced so two

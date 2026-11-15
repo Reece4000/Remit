@@ -75,3 +75,9 @@ CREATE OR REPLACE TRIGGER ledger_journal_entry
     BEFORE INSERT ON documents
     FOR EACH ROW WHEN (NEW.kind = 'ledger.journal_entry')
     EXECUTE FUNCTION ledger_check_journal_entry();
+
+-- The books are history: they are never emptied wholesale, any more than row by row.
+SELECT remit_forbid_truncate(target) FROM unnest(ARRAY[
+    'ledger_books', 'pgledger_accounts', 'pgledger_transfers', 'pgledger_entries',
+    'pgledger_idempotency_keys'
+]::regclass[]) AS target;

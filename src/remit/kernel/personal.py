@@ -9,9 +9,9 @@ import base64
 import json
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from functools import cache
-from typing import Annotated, Any, get_args, get_origin
+from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints, is_typeddict
 from uuid import UUID, uuid7
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -69,6 +69,47 @@ def unsealable(model: type[BaseModel]) -> str | None:
             if reason := unsealable(nested):
                 return reason
     return None
+
+
+def unsealable_result(annotation: Any) -> str | None:
+    """Why personal data in a value of this type could not be sealed, if it could not.
+
+    For what a command returns, which is kept in its idempotency record. Sealing follows
+    models and tuples or lists of them; anything else that could carry personal data (a
+    mapping, a set, a dataclass, a bare value marked personal) is refused.
+    """
+    if _marked_within(annotation):
+        return "is marked personal itself; return the document the value belongs to"
+    return _unsealable_in(annotation, "", set())
+
+
+def _unsealable_in(annotation: Any, within: str, seen: set[int]) -> str | None:
+    if id(annotation) in seen:
+        return None
+    seen.add(id(annotation))
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        if within and carries_personal(annotation):
+            return f"holds personal data inside a {within}"
+        return unsealable(annotation)
+    if _is_record(annotation):
+        record = cast(type[Any], annotation)
+        hints = get_type_hints(record, include_extras=True).values()
+        inner = within or record.__name__
+        return next((r for h in hints if (r := _unsealable_in(h, inner, seen))), None)
+    origin = get_origin(annotation)
+    if origin is None:
+        return None
+    if isinstance(origin, type) and issubclass(origin, (Mapping, set, frozenset)):
+        within = within or origin.__name__
+    arguments = get_args(annotation)
+    return next((r for a in arguments if (r := _unsealable_in(a, within, seen))), None)
+
+
+def _is_record(annotation: Any) -> bool:
+    """A dataclass or TypedDict: a type with fields that sealing cannot follow."""
+    return isinstance(annotation, type) and (
+        is_dataclass(annotation) or is_typeddict(cast(Any, annotation))
+    )
 
 
 def _marked_within(annotation: Any) -> bool:

@@ -33,6 +33,12 @@ Personal]`), and registration refuses two things sealing could not follow rather
 store them in the clear: a mark on part of a type (`Annotated[str, Personal] | None`),
 and personal data inside a mapping or a set.
 
+What a command returns is kept too, in its idempotency record, so registration checks
+the handler's return annotation by the same rules. A result may carry personal data in
+documents and other models, and in tuples or lists of them. It may not carry it in a
+mapping, a set, a dataclass or a `TypedDict`, or as a bare value marked personal:
+return the document the value belongs to.
+
 Events may not carry personal fields; registration refuses one that does. Events are
 broadcast to every subscriber and kept for good, so they carry ids and codes, never
 personal values.
@@ -63,7 +69,9 @@ A module erases a subject in two steps, in one unit of work:
 2. It calls `context.erase(document)`.
 
 `context.erase` refuses while any personal value remains in the document, at any
-depth. When the unit commits, every data key linked to the subject is deleted. Older
+depth, and the kernel checks again when the handler returns, so that a write after the
+call cannot put a value back. Only the module that owns the document can erase it. When
+the unit commits, every data key linked to the subject is deleted. Older
 audit entries then read back with `"[erased]"` in place of the personal values. An
 idempotency record whose key was deleted cannot be replayed, so a retry is refused and
 asked to use a new key. The erasure's own record holds nothing personal and is not

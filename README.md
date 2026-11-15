@@ -29,10 +29,12 @@ entry in the audit trail.
   refused in the same words, which an agent can read and act on.
 - **Anything can be tried first.** A dry run executes a command for real and rolls it
   back, reporting what would have happened.
-- **Retries are safe.** A command sent twice with the same idempotency key runs once.
+- **Retries are safe.** A command an actor sends twice with the same idempotency key runs
+  once. Keys belong to the actor, so two actors' keys never collide.
 - **Modules react to each other through events.** A subscription's effects commit with
   its place in the event log, so each event takes effect exactly once however many
-  workers run.
+  workers run. A subscription that fails keeps its place and is retried, without
+  holding up any other.
 - **Everything is described by its own declarations.** Documents, lifecycles, commands
   and events are available as JSON Schema from the registry. A declaration without a
   docstring does not register.
@@ -42,7 +44,12 @@ entry in the audit trail.
   [personal data](docs/personal-data.md).
 - **Modules build on modules.** A module declares the modules it requires, may use
   only their public API and react only to their events, and brings them with it when
-  installed. Remit's own standard modules follow the same rules as anyone else's.
+  installed. It writes only its own documents: to change another module's, it executes
+  that module's commands. Remit's own standard modules follow the same rules as anyone
+  else's.
+- **Money is exact.** Currencies and their minor units come from the ISO 4217 table as
+  published, an amount never mixes currencies, and arithmetic never rounds except where
+  a rounding mode is named (`times`, `convert`, `allocate`).
 - **The books are double-entry and multi-currency**, kept by
   [pgledger](https://github.com/pgr0ss/pgledger) in the same transaction as everything
   else.
@@ -188,23 +195,31 @@ which puts the posting in the same transaction as the document that caused it.
 | A command's documents, events, audit entry and postings commit together or not at all | One database transaction per command | Tests that refuse commands midway and look for traces |
 | Rules a handler checks still hold when it commits, whatever else is running | Serialisable transactions, retried on conflict | Threads racing for the same account code, reversal, period close and event |
 | The ledger always balances | The ledger's commands, a database trigger, and pgledger's two-sided transfers | Property tests over random command sequences, recomputing each balance independently |
-| Posted entries, the event log and the audit trail cannot be altered | Database triggers, as well as the kernel | Tests that write to the tables directly and expect refusal |
+| Posted entries, the event log and the audit trail cannot be altered or emptied | Database triggers on rows and on TRUNCATE, as well as the kernel | Tests that write to the tables directly and expect refusal |
+| Nothing changes except through a command | Writes go only through the kernel's commit; reads run in read-only transactions | Updates and inserts sent through `Kernel.sql` |
 | Nothing is posted into a closed period | The ledger's commands and a database trigger | Both of the above |
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
 | A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
 | Codes and other unique values are never shared | A document's `unique` fields, checked by the kernel and indexed by the database | Threads racing for the same code, and direct inserts of a duplicate |
 | A module imports, and reacts to events from, only the modules it requires | An architecture test over every import; the registry, for subscriptions | Modules that try to react to undeclared events |
+| A module writes only its own documents and emits only its own events | The unit of work, which knows whose code is running | Commands and subscriptions that write another module's documents or emit its events |
+| One subscription's failure never stops another's delivery | Each delivery is its own unit of work, and any error in it is recorded, not raised | Subscriptions that raise refusals and ordinary Python errors |
 | Personal data in the audit trail is unreadable once its subject is erased, and never stored in the clear | Encryption under per-subject keys, and registration refuses personal data in events | Raw tables searched for personal values; erasure through nested data and replays |
-| A kernel runs only modules its database was installed with, as currently defined | Each install records a fingerprint of the module's migrations, rules and unique fields | Kernels started against missing or changed installs |
+| A kernel runs only modules its database was installed with, as currently defined | Each install records a fingerprint of the kernel's and each module's migrations, rules and unique fields | Kernels started against missing or changed installs |
+| A migration, once applied, never changes | Each is recorded with a digest, and install refuses one that differs | Migrations edited after they were applied |
+| Every store refuses the same things | Shared field types refuse unprintable text, and every commit is checked for text PostgreSQL cannot store | The kernel's tests, run against both stores |
 
-`./check --deep` goes one step further: it breaks the framework in seventeen ways, one at
-a time, and confirms the tests fail for each.
+`./check --deep` goes one step further: it breaks the framework in twenty-two ways, one
+at a time, and confirms the tests fail for each.
 
 Some things are trusted rather than checked, because modules are code you choose to
 install:
 
-- `context.sql` runs any SQL in the unit of work, so a module that uses it could read
-  other modules' tables or documents.
+- `context.sql` runs SQL with the kernel's own database rights, so a module that uses it
+  could read or write other modules' tables, or the documents table itself, outside
+  the ownership rule and without an audit entry. The database still refuses changes to
+  final documents and to history, whoever sends them. A database role for each module,
+  limited to its own tables, is the planned fix.
 - `context.execute` runs another module's command on the authority of the command
   already running, without checking that permission again. That is deliberate: a clerk
   who may issue an invoice should not also need permission to post journal entries for

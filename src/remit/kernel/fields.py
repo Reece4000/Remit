@@ -1,6 +1,7 @@
 """Field types that many modules share, so that the same thing is validated the same way
 everywhere it appears."""
 
+import unicodedata
 from importlib.resources import files
 from typing import Annotated
 
@@ -14,8 +15,40 @@ Upper-case letters and digits, with `.`, `_`, `/` or `-` between them; at most 3
 characters. A code identifies a record to people; its id identifies it to the system.
 """
 
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-"""What a record is called. Never blank; surrounding whitespace is removed."""
+
+_UNPRINTABLE = frozenset({"Cc", "Cs", "Zl", "Zp"})
+"""Control characters, lone surrogates, and line and paragraph separators."""
+
+
+def _printable(allowed: str, what: str) -> AfterValidator:
+    def check(text: str) -> str:
+        for character in text:
+            if character not in allowed and unicodedata.category(character) in _UNPRINTABLE:
+                raise ValueError(f"U+{ord(character):04X} cannot be part of {what}")
+        return text
+
+    return AfterValidator(check)
+
+
+SingleLine = _printable("", "a single line of text")
+"""Refuses control characters and line breaks. Add it to any text field of one line:
+`Annotated[str, StringConstraints(max_length=40), SingleLine]`.
+
+None of those characters belongs in text people read; a NUL cannot even be stored in
+PostgreSQL's JSON, nor a lone surrogate encoded.
+"""
+
+MultiLine = _printable("\n\t", "text")
+"""Like `SingleLine`, but allows line breaks and tabs."""
+
+Name = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), SingleLine
+]
+"""What a record is called, on one line. Never blank; surrounding whitespace is removed."""
+
+Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1), MultiLine]
+"""Free text, such as a description or a note: lines and tabs, but no other control
+characters. Never blank; surrounding whitespace is removed."""
 
 
 def _assigned(code: str) -> str:

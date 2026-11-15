@@ -2,7 +2,8 @@
 
 Each unit is one SERIALIZABLE transaction on a pooled connection. PostgreSQL aborts a
 transaction it cannot fit into a serial order; that surfaces here as `ConcurrencyError`
-and the kernel runs the unit again.
+and the kernel runs the unit again. A read-only unit is also DEFERRABLE: it waits for a
+snapshot no writer can invalidate, so it is never aborted and never aborts a writer.
 """
 
 import hashlib
@@ -10,31 +11,48 @@ import json
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from importlib.resources import files
-from typing import Any, cast
+from typing import Any, LiteralString, cast
 from uuid import UUID
 
-from psycopg import Connection, IsolationLevel, errors, sql
+from psycopg import Connection, Cursor, IsolationLevel, errors, sql
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .actor import Actor
-from .errors import ConcurrencyError, RegistrationError
-from .module import Module, installation_order
+from .errors import ConcurrencyError, RegistrationError, Rejected, RemitError
+from .module import Migration, Module, installation_order
 from .store import AuditEntry, Commit, Json, StoredEvent, Unit
 
-_SCHEMA = files(__package__).joinpath("schema.sql").read_bytes()
+_SQL = files(__package__).joinpath("sql")
+
+_KERNEL = "remit.kernel"
+"""The kernel's name where it records its own migrations. No module can take it: module
+names cannot contain a dot."""
+
+_KERNEL_MIGRATIONS = (
+    Migration("0001-tables", _SQL.joinpath("0001-tables.sql").read_text()),
+    Migration(
+        "0002-idempotency-per-actor", _SQL.joinpath("0002-idempotency-per-actor.sql").read_text()
+    ),
+)
+_KERNEL_RULES = _SQL.joinpath("rules.sql").read_text()
 
 # Held from the moment a unit records events until it commits, so that events become
 # visible in the same order as their positions and no subscriber can skip one.
 _EVENT_ORDER_LOCK = 7_154_697_431
+
+# Held while installing, so that two installs cannot interleave their migrations.
+_INSTALL_LOCK = 7_154_697_432
 
 _MAX_IDENTIFIER = 63  # PostgreSQL's NAMEDATALEN - 1, in bytes
 _UNIQUE_PREFIX = "unique "
 
 # A unique violation is retried because two units can race to claim the same value (an
 # idempotency key, a code): the retry then sees the winner and is refused or replayed.
-
 _UNSERIALISABLE = (errors.SerializationFailure, errors.DeadlockDetected, errors.UniqueViolation)
+
+# The codes the database's own rules raise with (see sql/rules.sql), and modules' too.
+_REFUSED = (errors.CheckViolation, errors.IntegrityConstraintViolation)
 
 
 class PostgresStore:
@@ -47,36 +65,30 @@ class PostgresStore:
         self._pool.open(wait=True, timeout=timeout)
 
     def install(self, modules: Iterable[Module] = ()) -> None:
-        """Create the kernel's tables, then each module's migrations, indexes and rules.
+        """Install the kernel's tables, then each module's migrations, indexes and rules.
 
-        Modules are installed with everything they require, dependencies first. Each is
-        recorded with a fingerprint of its storage declarations, so that a kernel can
-        refuse to run a module the store was not installed with.
+        Modules are installed with everything they require, dependencies first. Each
+        migration is applied once and recorded with a digest; one that has changed since
+        it was applied is refused, since applying it again is not possible and skipping
+        it would leave the database out of step with its definition. Each module, and
+        the kernel, is recorded with a fingerprint of its storage declarations, so that
+        a kernel can refuse to run what the store was not installed with.
+
+        All of it happens in one transaction: an install that fails changes nothing.
         """
-        with self._pool.connection() as connection:
-            connection.execute(_SCHEMA)
+        with self._connection(read_only=False) as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(%s)", (_INSTALL_LOCK,))
+            connection.execute(_SQL.joinpath("bootstrap.sql").read_bytes())
+            _apply(connection, _KERNEL, _KERNEL_MIGRATIONS, _KERNEL_RULES)
+            _record(connection, _KERNEL, _kernel_fingerprint())
             for module in installation_order(modules):
                 _install_unique_indexes(connection, module)
-                for migration in module.migrations:
-                    claimed = connection.execute(
-                        "INSERT INTO migrations (module, name) VALUES (%s, %s) "
-                        "ON CONFLICT DO NOTHING",
-                        (module.name, migration.name),
-                    )
-                    if claimed.rowcount:
-                        connection.execute(migration.sql.encode())
-                if module.sql:
-                    connection.execute(module.sql.encode())
-                connection.execute(
-                    "INSERT INTO installed_modules (module, fingerprint) VALUES (%s, %s) "
-                    "ON CONFLICT (module) DO UPDATE "
-                    "SET fingerprint = EXCLUDED.fingerprint, installed_at = now()",
-                    (module.name, fingerprint(module)),
-                )
+                _apply(connection, module.name, module.migrations, module.sql)
+                _record(connection, module.name, fingerprint(module))
 
     def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
         """Why this store cannot yet run these modules. Empty when it can."""
-        with self._pool.connection() as connection:
+        with self._connection(read_only=True) as connection:
             (ready,) = connection.execute(
                 "SELECT to_regclass('installed_modules') IS NOT NULL"
             ).fetchone() or (False,)
@@ -86,6 +98,8 @@ class PostgresStore:
                 connection.execute("SELECT module, fingerprint FROM installed_modules").fetchall()
             )
         problems: list[str] = []
+        if installed.get(_KERNEL) != _kernel_fingerprint():
+            problems.append("the kernel's tables were installed by a different version of Remit")
         for module in modules:
             if module.name not in installed:
                 problems.append(f"module {module.name!r} is not installed in this database")
@@ -97,26 +111,78 @@ class PostgresStore:
         self._pool.close()
 
     @contextmanager
-    def unit(self) -> Generator[Unit]:
-        try:
-            with self._pool.connection() as connection:
-                yield _PostgresUnit(connection)
-        except _UNSERIALISABLE as conflict:
-            constraint = conflict.diag.constraint_name
-            detail = f" (conflict on {constraint})" if constraint else ""
-            raise ConcurrencyError(
-                f"the database could not serialise this unit of work{detail}"
-            ) from conflict
+    def unit(self, *, read_only: bool = False) -> Generator[Unit]:
+        with _translated(), self._connection(read_only=read_only) as connection:
+            yield _PostgresUnit(connection)
+
+    @contextmanager
+    def _connection(self, *, read_only: bool) -> Generator[Connection[Any]]:
+        with self._pool.connection() as connection:
+            # Set on every use: a pooled connection keeps what its last user set.
+            connection.read_only = read_only
+            connection.deferrable = read_only
+            yield connection
 
 
 def fingerprint(module: Module) -> str:
     """A digest of everything about a module that installing it puts in the database."""
-    declared = {
-        "migrations": [(migration.name, migration.sql) for migration in module.migrations],
-        "sql": module.sql,
-        "unique": sorted(_unique_indexes(module)),
-    }
+    return _digest(
+        {
+            "migrations": [(migration.name, migration.sql) for migration in module.migrations],
+            "sql": module.sql,
+            "unique": sorted(_unique_indexes(module)),
+        }
+    )
+
+
+def _kernel_fingerprint() -> str:
+    return _digest(
+        {"migrations": [(m.name, m.sql) for m in _KERNEL_MIGRATIONS], "sql": _KERNEL_RULES}
+    )
+
+
+def _digest(declared: object) -> str:
     return hashlib.sha256(json.dumps(declared, sort_keys=True).encode()).hexdigest()
+
+
+def _apply(
+    connection: Connection[Any], owner: str, migrations: Sequence[Migration], rules: str
+) -> None:
+    """Apply what has not been applied of `owner`'s migrations, in order, then its rules."""
+    for migration in migrations:
+        digest = hashlib.sha256(migration.sql.encode()).hexdigest()
+        row = connection.execute(
+            "SELECT digest FROM migrations WHERE module = %s AND name = %s",
+            (owner, migration.name),
+        ).fetchone()
+        if row is None:
+            connection.execute(migration.sql.encode())
+            connection.execute(
+                "INSERT INTO migrations (module, name, digest) VALUES (%s, %s, %s)",
+                (owner, migration.name, digest),
+            )
+        elif row[0] is None:
+            connection.execute(
+                "UPDATE migrations SET digest = %s WHERE module = %s AND name = %s",
+                (digest, owner, migration.name),
+            )
+        elif row[0] != digest:
+            raise RegistrationError(
+                f"migration {migration.name!r} of {owner} has changed since it was applied; "
+                "a migration that has been applied must never change, so restore it and "
+                "put the change in a new migration"
+            )
+    if rules:
+        connection.execute(rules.encode())
+
+
+def _record(connection: Connection[Any], owner: str, fingerprint: str) -> None:
+    connection.execute(
+        "INSERT INTO installed_modules (module, fingerprint) VALUES (%s, %s) "
+        "ON CONFLICT (module) DO UPDATE "
+        "SET fingerprint = EXCLUDED.fingerprint, installed_at = now()",
+        (owner, fingerprint),
+    )
 
 
 def _unique_indexes(module: Module) -> dict[str, tuple[str, str]]:
@@ -138,13 +204,13 @@ def _install_unique_indexes(connection: Connection[Any], module: Module) -> None
     would look like contention rather than a rule.
     """
     declared = _unique_indexes(module)
-    ours = f"{_UNIQUE_PREFIX}{module.name}."
     existing = {
         name
         for (name,) in connection.execute(
             "SELECT indexname FROM pg_indexes WHERE tablename = 'documents'"
         ).fetchall()
-        if name.startswith(ours)
+        if name.startswith(_UNIQUE_PREFIX)
+        and name.removeprefix(_UNIQUE_PREFIX).split(".")[0] == module.name
     }
     for name in sorted(existing - declared.keys()):
         connection.execute(sql.SQL("DROP INDEX {name}").format(name=sql.Identifier(name)))
@@ -161,18 +227,45 @@ def _serialisable(connection: Connection[Any]) -> None:
     connection.isolation_level = IsolationLevel.SERIALIZABLE
 
 
+@contextmanager
+def _translated() -> Generator[None]:
+    """The database's errors as the kernel's: what to retry, and what was refused."""
+    try:
+        yield
+    except _UNSERIALISABLE as conflict:
+        constraint = conflict.diag.constraint_name
+        detail = f" (conflict on {constraint})" if constraint else ""
+        raise ConcurrencyError(
+            f"the database could not serialise this unit of work{detail}"
+        ) from conflict
+    except errors.ReadOnlySqlTransaction as refusal:
+        raise RemitError(
+            "nothing can be changed through a read; execute a command to change things"
+        ) from refusal
+    except _REFUSED as refusal:
+        raise Rejected(f"the database refused this: {refusal.diag.message_primary}") from refusal
+
+
 class _PostgresUnit:
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
 
+    def _execute(
+        self, query: LiteralString | bytes, parameters: Sequence[object] = ()
+    ) -> Cursor[Any]:
+        # Translated here as well as when the unit ends, so that a handler running SQL
+        # sees a conflict as the `ConcurrencyError` it is.
+        with _translated():
+            return self._connection.execute(query, parameters)
+
     def get(self, kind: str, id: UUID) -> Json | None:
-        row = self._connection.execute(
+        row = self._execute(
             "SELECT body FROM documents WHERE kind = %s AND id = %s", (kind, id)
         ).fetchone()
         return cast(Json, row[0]) if row else None
 
     def find(self, kind: str, equals: Mapping[str, object]) -> list[Json]:
-        rows = self._connection.execute(
+        rows = self._execute(
             "SELECT body FROM documents WHERE kind = %s AND body @> %s ORDER BY id",
             (kind, Jsonb(dict(equals))),
         ).fetchall()
@@ -181,7 +274,7 @@ class _PostgresUnit:
     def events(
         self, *, after: int = 0, name: str | None = None, limit: int | None = None
     ) -> list[StoredEvent]:
-        rows = self._connection.execute(
+        rows = self._execute(
             """
             SELECT position, name, body, at, actor FROM events
             WHERE position > %s AND (%s::text IS NULL OR name = %s)
@@ -192,25 +285,23 @@ class _PostgresUnit:
         return [StoredEvent(*row) for row in rows]
 
     def cursor(self, subscription: str) -> int:
-        row = self._connection.execute(
+        row = self._execute(
             "SELECT position FROM cursors WHERE subscription = %s", (subscription,)
         ).fetchone()
         return cast(int, row[0]) if row else 0
 
-    def idempotency(self, key: str) -> Json | None:
-        row = self._connection.execute(
-            "SELECT record FROM idempotency WHERE key = %s", (key,)
+    def idempotency(self, actor: str, key: str) -> Json | None:
+        row = self._execute(
+            "SELECT record FROM idempotency WHERE actor = %s AND key = %s", (actor, key)
         ).fetchone()
         return cast(Json, row[0]) if row else None
 
     def secret(self, key: UUID) -> bytes | None:
-        row = self._connection.execute(
-            "SELECT secret FROM data_keys WHERE id = %s", (key,)
-        ).fetchone()
+        row = self._execute("SELECT secret FROM data_keys WHERE id = %s", (key,)).fetchone()
         return bytes(row[0]) if row else None
 
     def audit(self) -> list[AuditEntry]:
-        rows = self._connection.execute(
+        rows = self._execute(
             "SELECT at, actor, action, input, documents, events, cause, key FROM audit ORDER BY id"
         ).fetchall()
         return [
@@ -228,14 +319,18 @@ class _PostgresUnit:
         ]
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
-        cursor = self._connection.execute(query.encode(), parameters)
+        cursor = self._execute(query.encode(), parameters)
         return cursor.fetchall() if cursor.description else []
 
     def rollback(self) -> None:
         self._connection.rollback()
 
+    def rehearse(self, commit: Commit) -> None:
+        self.commit(commit)
+        self.rollback()
+
     def commit(self, commit: Commit) -> None:
-        execute = self._connection.execute
+        execute = self._execute
         for document in commit.documents:
             values = (document.version, document.final, Jsonb(document.body))
             key = (document.kind, document.id)
@@ -298,5 +393,8 @@ class _PostgresUnit:
                 commit.cursor,
             )
         if commit.idempotency:
-            key, record = commit.idempotency
-            execute("INSERT INTO idempotency (key, record) VALUES (%s, %s)", (key, Jsonb(record)))
+            actor, key, record = commit.idempotency
+            execute(
+                "INSERT INTO idempotency (actor, key, record) VALUES (%s, %s, %s)",
+                (actor, key, Jsonb(record)),
+            )

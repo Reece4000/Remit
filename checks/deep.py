@@ -14,6 +14,7 @@ import sys
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from decimal import Context as DecimalContext
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -22,11 +23,12 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
-from remit.kernel import Document, Money, module, personal, postgres, registry
+from remit.kernel import Document, Money, kernel, module, money, personal, postgres, registry
 from remit.kernel.context import Context
 from remit.ledger import books, commands
 
 KERNEL = ["tests/test_kernel.py"]
+MONEY = ["tests/test_money.py"]
 MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
 STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
@@ -36,6 +38,7 @@ RACE_RUNS = 20
 
 real_movements = books.movements
 real_order = module.installation_order
+real_unit = postgres.PostgresStore.unit
 
 
 def ignoring_version(self: Context, kind: type[Document], id: object, **_: object) -> Document:
@@ -63,6 +66,14 @@ def read_committed(connection: Connection[Any]) -> None:
 
 def nothing(*_: object, **__: object) -> None:
     return None
+
+
+def writable(store: postgres.PostgresStore, *, read_only: bool = False) -> Any:
+    return real_unit(store, read_only=False)
+
+
+def rolled_back(unit: Any, commit: object) -> None:
+    unit.rollback()
 
 
 MUTATIONS = [
@@ -164,6 +175,31 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "modules write other modules' documents",
+        KERNEL,
+        swap(Context, "_require_owner", nothing),
+    ),
+    Mutation(
+        "text no store can keep reaches the store",
+        KERNEL,
+        swap(kernel, "unstorable", nothing),
+    ),
+    Mutation(
+        "reads can change things",
+        RACES,
+        swap(postgres.PostgresStore, "unit", writable),
+    ),
+    Mutation(
+        "dry runs skip the database's own rules",
+        RACES,
+        swap(postgres._PostgresUnit, "rehearse", rolled_back),  # pyright: ignore[reportPrivateUsage]
+    ),
+    Mutation(
+        "money arithmetic rounds to Python's default precision",
+        MONEY,
+        swap(money, "_EXACT", DecimalContext()),
+    ),
+    Mutation(
         "units of work are not serialisable",
         RACES,
         swap(postgres, "_serialisable", read_committed),
@@ -188,7 +224,7 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *RACES]):
+    if not passes([*KERNEL, *MONEY, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *RACES]):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")

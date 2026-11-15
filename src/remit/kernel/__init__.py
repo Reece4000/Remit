@@ -12,7 +12,7 @@ from .errors import (
     RemitError,
     Unauthorised,
 )
-from .fields import Code, Country, Name, UnitCode, unit_name
+from .fields import Code, Country, MultiLine, Name, SingleLine, Text, UnitCode, unit_name
 from .kernel import DeliveryFailure, Dispatched, Kernel
 from .message import Command, Event, Outcome, Recorded
 from .module import Migration, Module
@@ -44,6 +44,7 @@ __all__ = [
     "Migration",
     "Module",
     "Money",
+    "MultiLine",
     "Name",
     "NotFound",
     "Outcome",
@@ -55,7 +56,9 @@ __all__ = [
     "Registry",
     "Rejected",
     "RemitError",
+    "SingleLine",
     "Store",
+    "Text",
     "Transition",
     "Unauthorised",
     "Unit",

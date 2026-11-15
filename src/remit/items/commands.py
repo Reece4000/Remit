@@ -15,8 +15,6 @@ from .model import (
     module,
 )
 
-_AMENDABLE = ("name", "description")
-
 
 class AddItem(Command[Item]):
     code: Code
@@ -62,11 +60,7 @@ def amend_item(command: AmendItem, context: Context) -> Item:
     item = context.get(Item, command.item_id, version=command.version)
     if item.state == "discontinued":
         raise Rejected(f"item {item.code} is discontinued; reinstate it before amending it")
-    changes = {field: getattr(command, field) for field in _AMENDABLE}
-    changed = tuple(field for field, value in changes.items() if getattr(item, field) != value)
-    if not changed:
-        raise Rejected(f"nothing would change: item {item.code} already has these details")
-    amended = context.update(item, **changes)
+    amended, changed = context.revise(item, name=command.name, description=command.description)
     context.emit(ItemAmended(item_id=item.id, changed=changed))
     return amended
 

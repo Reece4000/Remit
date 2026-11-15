@@ -13,7 +13,7 @@ from .document import Document
 from .errors import RegistrationError
 from .message import Command, Event
 from .module import CommandSpec, Module, Subscription, installation_order
-from .personal import carries_personal, unsealable
+from .personal import carries_personal, unsealable, unsealable_result
 
 
 class Registry:
@@ -21,6 +21,7 @@ class Registry:
         """Register the modules and everything they require, dependencies first."""
         self.modules: dict[str, Module] = {}
         self._documents: dict[type[Document], str] = {}
+        self._document_owners: dict[type[Document], Module] = {}
         self._events: dict[type[Event], str] = {}
         self._event_owners: dict[type[Event], Module] = {}
         self._commands: dict[type[Command[Any]], CommandSpec] = {}
@@ -30,10 +31,13 @@ class Registry:
                 raise RegistrationError(f"module {module.name!r} is installed twice")
             self.modules[module.name] = module
             for name, document in module.documents.items():
+                _check_unclaimed(name, self._documents.get(document))
                 _check_lifecycle(name, document)
                 _check_sealable(name, document)
                 self._documents[document] = name
+                self._document_owners[document] = module
             for name, event in module.events.items():
+                _check_unclaimed(name, self._events.get(event))
                 _check_sealable(name, event)
                 if carries_personal(event):
                     raise RegistrationError(
@@ -43,7 +47,14 @@ class Registry:
                 self._events[event] = name
                 self._event_owners[event] = module
             for spec in module.commands.values():
+                claimed = self._commands.get(spec.command)
+                _check_unclaimed(spec.name, claimed.name if claimed else None)
                 _check_sealable(spec.name, spec.command)
+                if reason := unsealable_result(spec.result):
+                    raise RegistrationError(
+                        f"{spec.name}: what it returns {reason}, where it could not be sealed "
+                        "in its idempotency record"
+                    )
                 self._commands[spec.command] = spec
 
         self.subscriptions: tuple[Subscription, ...] = tuple(
@@ -62,6 +73,14 @@ class Registry:
 
     def command(self, kind: type[Command[Any]]) -> CommandSpec:
         return _resolve(self._commands, kind, "command")
+
+    def document_owner(self, kind: type[Document]) -> Module:
+        """The module that declares this document type, and alone may write it."""
+        return _resolve(self._document_owners, kind, "document")
+
+    def event_owner(self, kind: type[Event]) -> Module:
+        """The module that declares this event, and alone may emit it."""
+        return _resolve(self._event_owners, kind, "event")
 
     def document_type(self, name: str) -> type[Document]:
         return _resolve({name: kind for kind, name in self._documents.items()}, name, "document")
@@ -140,6 +159,14 @@ def _check_lifecycle(name: str, document: type[Document]) -> None:
             raise RegistrationError(
                 f"{name}: transition {transition.name!r} requires unknown fields {unknown}"
             )
+
+
+def _check_unclaimed(name: str, claimed: str | None) -> None:
+    if claimed is not None:
+        raise RegistrationError(
+            f"{name} is the class already registered as {claimed}; each module declares "
+            "its own classes"
+        )
 
 
 def _check_sealable(name: str, model: type[BaseModel]) -> None:

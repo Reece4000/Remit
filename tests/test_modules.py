@@ -284,3 +284,71 @@ def test_a_kernel_on_a_database_never_installed_says_so(installed_postgres: Post
         store.close()
         with psycopg.connect(DSN, autocommit=True) as connection:
             connection.execute(f"DROP DATABASE {fresh}")
+
+
+# Migrations are applied once and never change afterwards.
+
+
+def archive_module(create: str) -> Module:
+    return Module("test_archive", migrations=(Migration("create", create),))
+
+
+@pytest.fixture
+def fresh_archive(installed_postgres: PostgresStore) -> Iterator[PostgresStore]:
+    def forget() -> None:
+        with psycopg.connect(DSN) as connection:
+            connection.execute("DROP TABLE IF EXISTS test_archive")
+            connection.execute("DELETE FROM migrations WHERE module = 'test_archive'")
+            connection.execute("DELETE FROM installed_modules WHERE module = 'test_archive'")
+
+    forget()
+    yield installed_postgres
+    forget()
+
+
+def columns_of_test_archive() -> list[str]:
+    with psycopg.connect(DSN) as connection:
+        rows = connection.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'test_archive' ORDER BY ordinal_position"
+        ).fetchall()
+    return [name for (name,) in rows]
+
+
+def test_a_migration_edited_after_it_was_applied_is_refused(fresh_archive: PostgresStore) -> None:
+    fresh_archive.install([archive_module("CREATE TABLE test_archive (id int)")])
+    edited = archive_module("CREATE TABLE test_archive (id int, label text)")
+
+    with pytest.raises(RegistrationError, match="'create' of test_archive has changed since"):
+        fresh_archive.install([edited])
+    with pytest.raises(RegistrationError, match="installed from a different definition"):
+        Kernel([edited], store=fresh_archive)
+    assert columns_of_test_archive() == ["id"]
+
+
+def test_a_migration_applied_before_digests_were_kept_is_adopted(
+    fresh_archive: PostgresStore,
+) -> None:
+    module = archive_module("CREATE TABLE test_archive (id int)")
+    fresh_archive.install([module])
+    with psycopg.connect(DSN) as connection:
+        connection.execute("UPDATE migrations SET digest = NULL WHERE module = 'test_archive'")
+
+    fresh_archive.install([module])
+    with pytest.raises(RegistrationError, match="has changed since"):
+        fresh_archive.install([archive_module("CREATE TABLE test_archive (id bigint)")])
+
+
+def test_a_kernel_refuses_a_database_installed_by_another_version_of_remit(
+    installed_postgres: PostgresStore,
+) -> None:
+    with psycopg.connect(DSN) as connection:
+        connection.execute(
+            "UPDATE installed_modules SET fingerprint = 'older' WHERE module = 'remit.kernel'"
+        )
+    try:
+        with pytest.raises(RegistrationError, match="installed by a different version of Remit"):
+            Kernel([], store=installed_postgres)
+    finally:
+        installed_postgres.install()
+    Kernel([], store=installed_postgres)

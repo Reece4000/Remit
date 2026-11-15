@@ -10,10 +10,23 @@ from uuid import uuid4
 import psycopg
 import pytest
 from conftest import DSN, kernel_on
-from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, desk
+from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, TicketResolved, desk
 
 from remit import items, ledger, parties
-from remit.kernel import Actor, ActorKind, Kernel, Money, PostgresStore, Rejected
+from remit.kernel import (
+    Actor,
+    ActorKind,
+    Command,
+    Context,
+    Document,
+    Kernel,
+    Lifecycle,
+    Module,
+    Money,
+    PostgresStore,
+    Rejected,
+    RemitError,
+)
 from remit.ledger import AccountType, credit, debit
 
 BOOKKEEPER = Actor(id="bookkeeper", kind=ActorKind.HUMAN, permissions=frozenset({"ledger.*"}))
@@ -122,6 +135,13 @@ def test_the_database_itself_refuses_to_alter_history(kernel: Kernel, accounts) 
         "DELETE FROM events",
         "UPDATE audit SET action = 'nothing happened'",
         "DELETE FROM audit",
+        "TRUNCATE audit",
+        "TRUNCATE events",
+        "TRUNCATE documents",
+        "TRUNCATE data_keys CASCADE",
+        "TRUNCATE cursors, idempotency",
+        "TRUNCATE pgledger_entries CASCADE",
+        "TRUNCATE ledger_books",
     ]
     for statement in tampering:
         with pytest.raises(psycopg.errors.IntegrityError), psycopg.connect(DSN) as connection:
@@ -304,3 +324,94 @@ def test_many_workers_deliver_each_event_exactly_once(kernel: Kernel) -> None:
     assert sum(result for result in results if isinstance(result, int)) == 20
     assert len(kernel.find(Notice)) == 20
     assert len({notice.ticket_id for notice in kernel.find(Notice)}) == 20
+
+
+def test_nothing_can_be_changed_through_the_kernels_reads(kernel: Kernel) -> None:
+    ticket = kernel.execute(OpenTicket(subject="Printer"), actor=AGENT).result
+
+    with pytest.raises(RemitError, match="nothing can be changed through a read"):
+        kernel.sql('UPDATE documents SET body = body || \'{"subject": "Edited"}\'')
+    with pytest.raises(RemitError, match="nothing can be changed through a read"):
+        kernel.sql("INSERT INTO cursors (subscription, position) VALUES ('desk.x', 99)")
+    assert kernel.get(type(ticket), ticket.id) == ticket
+    assert len(kernel.audit()) == 1
+
+
+# A module whose rule lives only in the database, as a trigger.
+
+vault = Module(
+    "vault",
+    sql="""
+    CREATE OR REPLACE FUNCTION vault_refuse_secrets() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.body ->> 'text' = 'secret' THEN
+            RAISE EXCEPTION 'secrets are not kept here' USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END $$;
+    CREATE OR REPLACE TRIGGER vault_refuse_secrets BEFORE INSERT ON documents
+        FOR EACH ROW WHEN (NEW.kind = 'vault.note') EXECUTE FUNCTION vault_refuse_secrets();
+    """,
+)
+
+
+@vault.document
+class Note(Document):
+    """A note."""
+
+    lifecycle = Lifecycle(initial="kept")
+
+    text: str
+
+
+class KeepNote(Command[Note]):
+    text: str
+
+
+@vault.command
+def keep_note(command: KeepNote, context: Context) -> Note:
+    """Keep a note."""
+    return context.create(Note(text=command.text))
+
+
+def test_a_dry_run_is_refused_by_rules_the_database_enforces(postgres: PostgresStore) -> None:
+    kernel = kernel_on(postgres, [vault])
+
+    with pytest.raises(Rejected, match="the database refused this: secrets are not kept here"):
+        kernel.execute(KeepNote(text="secret"), actor=AGENT_EVERYWHERE, dry_run=True)
+    with pytest.raises(Rejected, match="secrets are not kept here"):
+        kernel.execute(KeepNote(text="secret"), actor=AGENT_EVERYWHERE)
+
+    preview = kernel.execute(KeepNote(text="shopping"), actor=AGENT_EVERYWHERE, dry_run=True)
+    assert not preview.committed
+    assert kernel.find(Note) == []
+    assert kernel.audit() == []
+
+
+AGENT_EVERYWHERE = Actor(id="agent:all", kind=ActorKind.AGENT, permissions=frozenset({"*"}))
+
+
+archivist = Module("archivist", requires=(vault, desk))
+
+
+@archivist.subscribe(TicketResolved)
+def file_secretly(event: TicketResolved, context: Context) -> None:
+    """Keep a note the vault's database rule refuses when the unit commits."""
+    context.execute(KeepNote(text="secret"))
+
+
+def test_a_delivery_the_database_refuses_does_not_stop_the_others(
+    postgres: PostgresStore,
+) -> None:
+    kernel = kernel_on(postgres, [archivist])
+    ticket = kernel.execute(OpenTicket(subject="Printer"), actor=AGENT).result
+    kernel.execute(
+        MoveTicket(ticket_id=ticket.id, transition="resolve", resolution="Done"), actor=AGENT
+    )
+
+    dispatched = kernel.dispatch()
+
+    [failure] = dispatched.failures
+    assert failure.subscription == "archivist.file_secretly"
+    assert "secrets are not kept here" in failure.error
+    assert len(kernel.find(Notice)) == 1
