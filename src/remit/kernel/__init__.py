@@ -7,6 +7,7 @@ from .errors import (
     ConcurrencyError,
     CurrencyMismatch,
     NotFound,
+    Problem,
     RegistrationError,
     Rejected,
     RemitError,
@@ -14,12 +15,14 @@ from .errors import (
 )
 from .fields import Code, Country, MultiLine, Name, SingleLine, Text, UnitCode, unit_name
 from .kernel import DeliveryFailure, Dispatched, Kernel
-from .message import Command, Event, Outcome, Recorded
+from .message import Command, Event, Outcome, Query, Recorded
 from .module import Migration, Module
 from .money import Currency, Money, minor_units
 from .personal import ERASED, Personal
 from .postgres import PostgresStore
+from .reference import References
 from .registry import Registry
+from .selection import Page
 from .store import AuditEntry, MemoryStore, Store, Unit
 
 __all__ = [
@@ -48,10 +51,14 @@ __all__ = [
     "Name",
     "NotFound",
     "Outcome",
+    "Page",
     "Personal",
     "PostgresStore",
+    "Problem",
+    "Query",
     "Reader",
     "Recorded",
+    "References",
     "RegistrationError",
     "Registry",
     "Rejected",

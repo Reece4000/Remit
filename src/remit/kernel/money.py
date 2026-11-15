@@ -84,7 +84,7 @@ Currency = Annotated[str, AfterValidator(_held)]
 
 
 class Money(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
 
     currency: Currency
     amount: Decimal

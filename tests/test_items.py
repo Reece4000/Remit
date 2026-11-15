@@ -1,11 +1,12 @@
 """The items module, in memory and on PostgreSQL."""
 
 import pytest
+from conftest import ROOT, every
 from pydantic import ValidationError
 
 from remit import items
 from remit.items import AddItem, AmendItem, DiscontinueItem, Item, ItemKind, ReinstateItem
-from remit.kernel import Actor, ActorKind, Kernel, NotFound, Rejected, Store, unit_name
+from remit.kernel import Actor, ActorKind, Kernel, Rejected, Store, unit_name
 
 BUYER = Actor(id="buyer", kind=ActorKind.HUMAN, permissions=frozenset({"items.*"}))
 
@@ -30,7 +31,7 @@ def test_an_item_is_added_in_its_unit(kernel: Kernel) -> None:
 
     added = outcome.result
     assert (added.state, added.unit, added.description) == ("active", "XBX", None)
-    assert items.item(kernel, "WASHER-M8") == added
+    assert every(kernel, Item, code="WASHER-M8") == [added]
     assert outcome.events == (items.ItemAdded(item_id=added.id, code="WASHER-M8"),)
 
 
@@ -131,13 +132,8 @@ def test_a_discontinued_item_must_be_reinstated_before_it_is_amended(kernel: Ker
 
     reinstated = kernel.execute(ReinstateItem(item_id=bolt.id), actor=BUYER).result
     assert reinstated.state == "active"
-    assert [type(recorded.event) for recorded in kernel.events()] == [
+    assert [type(recorded.event) for recorded in kernel.events(actor=ROOT)] == [
         items.ItemAdded,
         items.ItemDiscontinued,
         items.ItemReinstated,
     ]
-
-
-def test_looking_up_a_code_that_does_not_exist_says_so(kernel: Kernel) -> None:
-    with pytest.raises(NotFound, match="no item with code 'NOPE'"):
-        items.item(kernel, "NOPE")

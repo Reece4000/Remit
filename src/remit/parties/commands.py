@@ -1,4 +1,10 @@
-"""The parties module's commands, and how to look parties and their details up."""
+"""The parties module's commands.
+
+Parties and their details are read as any documents are. A party's current contacts are
+`page(Contact, where={"party_id": party.id, "state": "current"})`; a party is found by
+its code with `where={"code": "C0001"}`, or by what a person remembers of it with
+`search="hollander"`.
+"""
 
 from typing import Annotated
 from uuid import UUID
@@ -12,9 +18,7 @@ from remit.kernel import (
     Context,
     Country,
     Name,
-    NotFound,
     Personal,
-    Reader,
     Rejected,
 )
 
@@ -23,17 +27,20 @@ from .model import (
     AddressAdded,
     AddressAmended,
     AddressErased,
+    AddressId,
     AddressRemoved,
     Contact,
     ContactAdded,
     ContactAmended,
     ContactErased,
+    ContactId,
     ContactRemoved,
     Line,
     Party,
     PartyAmended,
     PartyArchived,
     PartyErased,
+    PartyId,
     PartyKind,
     PartyRegistered,
     PartyRestored,
@@ -58,7 +65,7 @@ class AmendParty(Command[Party]):
     the tax number.
     """
 
-    party_id: UUID
+    party_id: PartyId
     version: int
     """The version these details were read at. Refused if the party has changed since."""
     name: Annotated[Name, Personal]
@@ -66,19 +73,19 @@ class AmendParty(Command[Party]):
 
 
 class ArchiveParty(Command[Party]):
-    party_id: UUID
+    party_id: PartyId
 
 
 class RestoreParty(Command[Party]):
-    party_id: UUID
+    party_id: PartyId
 
 
 class EraseParty(Command[Party]):
-    party_id: UUID
+    party_id: PartyId
 
 
 class AddContact(Command[Contact]):
-    party_id: UUID
+    party_id: PartyId
     name: Annotated[Name, Personal]
     role: Name | None = None
     email: Annotated[EmailStr | None, Personal] = None
@@ -88,7 +95,7 @@ class AddContact(Command[Contact]):
 class AmendContact(Command[Contact]):
     """Replace a contact's details. Every field is required; send null to clear one."""
 
-    contact_id: UUID
+    contact_id: ContactId
     version: int
     """The version these details were read at. Refused if the contact has changed since."""
     name: Annotated[Name, Personal]
@@ -98,15 +105,15 @@ class AmendContact(Command[Contact]):
 
 
 class RemoveContact(Command[Contact]):
-    contact_id: UUID
+    contact_id: ContactId
 
 
 class EraseContact(Command[Contact]):
-    contact_id: UUID
+    contact_id: ContactId
 
 
 class AddAddress(Command[Address]):
-    party_id: UUID
+    party_id: PartyId
     label: Name
     lines: Lines
     country: Country
@@ -115,7 +122,7 @@ class AddAddress(Command[Address]):
 class AmendAddress(Command[Address]):
     """Replace an address. Every field is required."""
 
-    address_id: UUID
+    address_id: AddressId
     version: int
     """The version this address was read at. Refused if it has changed since."""
     label: Name
@@ -124,11 +131,11 @@ class AmendAddress(Command[Address]):
 
 
 class RemoveAddress(Command[Address]):
-    address_id: UUID
+    address_id: AddressId
 
 
 class EraseAddress(Command[Address]):
-    address_id: UUID
+    address_id: AddressId
 
 
 @module.command
@@ -260,24 +267,6 @@ def remove_address(command: RemoveAddress, context: Context) -> Address:
 def erase_address(command: EraseAddress, context: Context) -> Address:
     """Erase an address's personal data, here and in the audit trail."""
     return _erase_address(context, context.get(Address, command.address_id))
-
-
-def party(reader: Reader, code: str) -> Party:
-    """The party with this code, whatever its state."""
-    found = reader.find(Party, code=code)
-    if not found:
-        raise NotFound(f"there is no party with code {code!r}")
-    return found[0]
-
-
-def contacts(reader: Reader, party_id: UUID) -> list[Contact]:
-    """A party's current contacts, oldest first."""
-    return reader.find(Contact, party_id=party_id, state="current")
-
-
-def addresses(reader: Reader, party_id: UUID) -> list[Address]:
-    """A party's current addresses, oldest first."""
-    return reader.find(Address, party_id=party_id, state="current")
 
 
 def _active(context: Context, party_id: UUID, *, version: int | None = None) -> Party:

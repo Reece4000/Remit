@@ -9,7 +9,7 @@ other unit were running. A store that cannot keep that promise for a unit raises
 
 import threading
 from collections import defaultdict
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -20,8 +20,7 @@ from uuid import UUID
 from .actor import Actor
 from .errors import ConcurrencyError, Rejected, RemitError
 from .module import Module
-
-type Json = dict[str, Any]
+from .selection import Json, Selection
 
 
 @dataclass(frozen=True)
@@ -31,6 +30,8 @@ class StoredDocument:
     version: int
     final: bool
     body: Json
+    search: str | None = None
+    """The folded text a listing's search looks in, when the document is searchable."""
 
 
 @dataclass(frozen=True)
@@ -84,8 +85,8 @@ class Commit:
 class Unit(Protocol):
     def get(self, kind: str, id: UUID) -> Json | None: ...
 
-    def find(self, kind: str, equals: Mapping[str, object]) -> list[Json]:
-        """Documents whose top-level fields equal the given JSON scalars, oldest first."""
+    def select(self, selection: Selection) -> list[Json]:
+        """The documents `selection.arranged` would pick from all those stored, in order."""
         ...
 
     def events(
@@ -161,12 +162,9 @@ class MemoryStore:
         document = self._documents[kind].get(id)
         return deepcopy(document.body) if document else None
 
-    def find(self, kind: str, equals: Mapping[str, object]) -> list[Json]:
-        return [
-            deepcopy(document.body)
-            for document in self._documents[kind].values()
-            if all(document.body.get(field) == value for field, value in equals.items())
-        ]
+    def select(self, selection: Selection) -> list[Json]:
+        stored = (document.body for document in self._documents[selection.kind].values())
+        return deepcopy(selection.arranged(stored))
 
     def events(
         self, *, after: int = 0, name: str | None = None, limit: int | None = None

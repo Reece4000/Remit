@@ -11,6 +11,7 @@ pgledger, which the module installs as a migration; see `books.py`.
 from datetime import date
 from enum import StrEnum
 from importlib.resources import files
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -25,12 +26,13 @@ from remit.kernel import (
     Module,
     Money,
     Name,
+    References,
     Transition,
 )
 
 
 class LedgerSettings(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
 
     base_currency: Currency
     """The currency the books are kept in."""
@@ -53,6 +55,9 @@ module = Module(
     sql=files(__package__).joinpath("rules.sql").read_text(),
 )
 
+AccountId = Annotated[UUID, References("ledger.account")]
+JournalEntryId = Annotated[UUID, References("ledger.journal_entry")]
+
 
 class AccountType(StrEnum):
     ASSET = "asset"
@@ -71,6 +76,7 @@ class Account(Document):
         transitions=(Transition("archive", source="active", target="archived"),),
     )
     unique = ("code",)
+    searchable = ("code", "name")
 
     code: Code
     name: Name
@@ -80,11 +86,15 @@ class Account(Document):
 
 
 class Posting(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    """One line of a journal entry: an amount debited (positive) or credited (negative)."""
 
-    account: UUID
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
+
+    account: AccountId
     amount: Money
+    """The amount in the currency it was in."""
     base: Money
+    """What the amount was worth in the base currency."""
 
 
 @module.document
@@ -92,11 +102,12 @@ class JournalEntry(Document):
     """A balanced set of postings. Final from the moment it exists; corrected by reversal."""
 
     lifecycle = Lifecycle(initial="posted")
+    searchable = ("description",)
 
     posting_date: date
     description: str
     postings: tuple[Posting, ...]
-    reverses: UUID | None = None
+    reverses: Annotated[UUID | None, References("ledger.journal_entry")] = None
 
 
 @module.document
@@ -112,7 +123,7 @@ class PeriodClose(Document):
 class AccountOpened(Event):
     """An account was added to the chart of accounts."""
 
-    account_id: UUID
+    account_id: AccountId
     code: str
 
 
@@ -120,16 +131,16 @@ class AccountOpened(Event):
 class AccountArchived(Event):
     """An account was archived and accepts no further postings."""
 
-    account_id: UUID
+    account_id: AccountId
 
 
 @module.event
 class JournalEntryPosted(Event):
     """A journal entry was posted. `reverses` is set when it cancels an earlier entry."""
 
-    entry_id: UUID
+    entry_id: JournalEntryId
     posting_date: date
-    reverses: UUID | None = None
+    reverses: Annotated[UUID | None, References("ledger.journal_entry")] = None
 
 
 @module.event

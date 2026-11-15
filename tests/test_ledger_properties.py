@@ -11,7 +11,7 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from conftest import empty_database
+from conftest import ROOT, empty_database, every, rows
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import (
@@ -69,10 +69,10 @@ class LedgerMachine(RuleBasedStateMachine):
     def footprint(self) -> tuple[object, ...]:
         kernel = self.kernel
         return (
-            len(kernel.audit()),
-            len(kernel.events()),
-            kernel.sql("SELECT count(*) FROM pgledger_transfers"),
-            ledger.trial_balance(kernel),
+            len(kernel.audit(actor=ROOT)),
+            len(kernel.events(actor=ROOT)),
+            rows("SELECT count(*) FROM pgledger_transfers"),
+            kernel.ask(ledger.TrialBalance(), actor=ROOT),
         )
 
     def attempt[R](self, command: Command[R]) -> R | None:
@@ -169,7 +169,7 @@ class LedgerMachine(RuleBasedStateMachine):
     @rule(through=closing_dates)
     def close_period(self, through: date) -> None:
         if self.attempt(ledger.ClosePeriod(through=through)):
-            self.closed = (through, ledger.trial_balance(self.kernel, as_of=through))
+            self.closed = (through, self.kernel.ask(ledger.TrialBalance(as_of=through), actor=ROOT))
 
     @rule(data=st.data())
     def archive_account(self, data: st.DataObject) -> None:
@@ -180,18 +180,20 @@ class LedgerMachine(RuleBasedStateMachine):
 
     @invariant()
     def the_ledger_balances(self) -> None:
-        assert Money.total(ledger.trial_balance(self.kernel).values(), BASE).is_zero
+        assert Money.total(
+            self.kernel.ask(ledger.TrialBalance(), actor=ROOT).values(), BASE
+        ).is_zero
 
     @invariant()
     def posted_entries_never_change(self) -> None:
-        stored = self.kernel.find(ledger.JournalEntry)
+        stored = every(self.kernel, ledger.JournalEntry)
         assert sorted(stored, key=lambda e: e.id) == sorted(self.entries, key=lambda e: e.id)
 
     @invariant()
     def closed_periods_never_change(self) -> None:
         if self.closed:
             through, balances = self.closed
-            now = ledger.trial_balance(self.kernel, as_of=through)
+            now = self.kernel.ask(ledger.TrialBalance(as_of=through), actor=ROOT)
             assert {account: now[account] for account in balances} == balances
 
     @invariant()
@@ -201,7 +203,10 @@ class LedgerMachine(RuleBasedStateMachine):
 
     @invariant()
     def archived_accounts_stay_empty(self) -> None:
-        assert all(ledger.balance(self.kernel, account).is_zero for account in self.archived)
+        assert all(
+            self.kernel.ask(ledger.AccountBalance(account_id=account), actor=ROOT).is_zero
+            for account in self.archived
+        )
 
     @invariant()
     def pgledger_agrees_with_the_journal(self) -> None:
@@ -215,13 +220,13 @@ class LedgerMachine(RuleBasedStateMachine):
                 foreign[posting.account][currency] = held + posting.amount
 
         for account in self.accounts:
-            held = ledger.balance(self.kernel, account.id)
+            held = self.kernel.ask(ledger.AccountBalance(account_id=account.id), actor=ROOT)
             assert held.base == base[account.id]
             assert held.foreign == foreign[account.id]
 
     @invariant()
     def the_books_reconcile(self) -> None:
-        assert ledger.reconcile(self.kernel) == []
+        assert self.kernel.ask(ledger.Reconcile(), actor=ROOT) == []
 
 
 def test_the_invariants_hold(postgres: PostgresStore) -> None:

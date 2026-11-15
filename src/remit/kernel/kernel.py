@@ -8,34 +8,42 @@ Every unit is a serialisable transaction, so the checks a handler makes still ho
 it commits, whatever else is running. When the store cannot serialise a unit, the kernel
 runs it again; handlers only touch the context, which makes that safe.
 
-Reads (`get`, `find`, `sql`, `events`, `audit`) run in read-only units: nothing can be
-changed through them, and on PostgreSQL they wait for a snapshot that can never
-conflict, so they are never aborted.
+Reads (`get`, `page`, `ask`, `events`, `audit`) name the actor who is reading, and are
+refused unless that actor holds the permission to read what is asked for. They run in
+read-only units: nothing can be changed through them, and on PostgreSQL they wait for
+a snapshot that can never conflict, so they are never aborted.
 """
 
 import random
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import cache, partial
 from typing import Any, cast
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .actor import Actor, ActorKind
 from .codec import Codec, unstorable
-from .context import Context
+from .context import Context, Reader
 from .document import Document
-from .errors import ConcurrencyError, RegistrationError, Rejected, RemitError, Unauthorised
-from .message import Command, Outcome, Recorded
+from .errors import (
+    ConcurrencyError,
+    NotFound,
+    RegistrationError,
+    Rejected,
+    RemitError,
+    Unauthorised,
+    invalid,
+)
+from .message import Command, Outcome, Query, Recorded
 from .module import CommandSpec, Module, Subscription
 from .personal import DataKey, carries_personal, seal, unseal
-from .registry import Registry
+from .registry import READ_AUDIT, READ_EVENTS, Registry
+from .selection import DEFAULT_LIMIT, Page
 from .store import AuditEntry, Commit, Json, MemoryStore, Store, SubjectKey, Unit
-
-_READER = Actor(id="system:kernel", kind=ActorKind.SYSTEM)
 
 
 @dataclass(frozen=True)
@@ -89,8 +97,7 @@ class Kernel:
     ) -> Outcome[R]:
         """Run a command. With `dry_run`, report what it would do and change nothing."""
         spec = self.registry.command(type(command))
-        if not actor.may(spec.name):
-            raise Unauthorised(f"{actor.id} does not hold the permission {spec.name}")
+        _authorise(actor, spec.name)
 
         def work(unit: Unit) -> Outcome[R]:
             if idempotency_key and (stored := unit.idempotency(actor.id, idempotency_key)):
@@ -119,6 +126,20 @@ class Kernel:
 
         return self._in_unit(work)
 
+    def command(self, name: str, input: Mapping[str, object]) -> Command[Any]:
+        """The command registered as `name`, built from JSON input, as an API receives it.
+
+        Refuses a name no installed module declares, and input the command does not
+        accept, with a problem for each field at fault.
+        """
+        spec = self.registry.find_command(name)
+        if spec is None:
+            raise NotFound(f"there is no command {name!r}; the registry describes those installed")
+        try:
+            return spec.command.model_validate(input)
+        except ValidationError as error:
+            raise invalid(name, error) from None
+
     def dispatch(self) -> Dispatched:
         """Deliver recorded events to subscriptions, once each and in order.
 
@@ -140,30 +161,69 @@ class Kernel:
                 delivered += 1
         return Dispatched(delivered, tuple(failures))
 
-    def get[D: Document](self, kind: type[D], id: UUID) -> D:
-        return self._read(lambda unit: self._context(unit, _READER).get(kind, id))
+    def query(self, name: str, input: Mapping[str, object]) -> Query[Any]:
+        """The query registered as `name`, built from JSON input, as an API receives it."""
+        spec = self.registry.find_query(name)
+        if spec is None:
+            raise NotFound(f"there is no query {name!r}; the registry describes those installed")
+        try:
+            return spec.query.model_validate(input)
+        except ValidationError as error:
+            raise invalid(name, error) from None
 
-    def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]:
-        return self._read(lambda unit: self._context(unit, _READER).find(kind, **equals))
+    def get[D: Document](self, kind: type[D], id: UUID, *, actor: Actor) -> D:
+        """A document by id, for an actor who may read documents of its kind."""
+        _authorise(actor, self.registry.read_permission(kind))
+        return self._read(lambda unit: self._reader(unit, actor).get(kind, id))
+
+    def page[D: Document](
+        self,
+        kind: type[D],
+        *,
+        actor: Actor,
+        where: Mapping[str, object] | None = None,
+        search: str | None = None,
+        order: str | None = None,
+        after: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+    ) -> Page[D]:
+        """One page of the documents of a kind, for an actor who may read them.
+
+        `where` filters, `search` looks in the kind's searchable fields, `order` names
+        the field to sort by, and `after` takes the last page's `next`. See
+        `remit.kernel.selection`.
+        """
+        _authorise(actor, self.registry.read_permission(kind))
+        return self._read(
+            lambda unit: self._reader(unit, actor).page(
+                kind, where=where, search=search, order=order, after=after, limit=limit
+            )
+        )
+
+    def ask[R](self, query: Query[R], *, actor: Actor) -> R:
+        """Answer a query, for an actor who holds its permission."""
+        spec = self.registry.query(type(query))
+        _authorise(actor, spec.permission)
+        return self._read(
+            lambda unit: cast(R, spec.handler(query, self._reader(unit, actor, spec.module)))
+        )
 
     def settings[S: BaseModel](self, kind: type[S]) -> S:
         return cast(S, self._settings[kind])
 
-    def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
-        """Read from the database. Nothing can be changed this way; commands change things."""
-        return self._read(lambda unit: unit.sql(query, parameters))
-
-    def events(self, *, after: int = 0) -> list[Recorded]:
+    def events(self, *, actor: Actor, after: int = 0) -> list[Recorded]:
         """The event log, in the order events were committed."""
+        _authorise(actor, READ_EVENTS)
         stored = self._read(lambda unit: unit.events(after=after))
         return [self._codec.load_event(event) for event in stored]
 
-    def audit(self) -> list[AuditEntry]:
+    def audit(self, *, actor: Actor) -> list[AuditEntry]:
         """Every command and delivery that committed, oldest first.
 
         Personal values read as they were given, or as `ERASED` once their subject has
         been erased.
         """
+        _authorise(actor, READ_AUDIT)
 
         def read(unit: Unit) -> list[AuditEntry]:
             secret = cache(unit.secret)
@@ -220,8 +280,19 @@ class Kernel:
                 time.sleep(random.uniform(0, 0.002 * 2**attempt))  # noqa: S311  jitter, not secrecy
         raise AssertionError("unreachable")
 
-    def _context(self, unit: Unit, actor: Actor, module: str = "") -> Context:
-        """A context for code of `module`. Readers belong to no module and write nothing."""
+    def _reader(self, unit: Unit, actor: Actor, module: str = "") -> Reader:
+        """A reader for an actor, or for a query of `module` asked on the actor's behalf."""
+        return Reader(
+            actor=actor,
+            now=self._clock(),
+            unit=unit,
+            registry=self.registry,
+            settings=self._settings,
+            module=module,
+        )
+
+    def _context(self, unit: Unit, actor: Actor, module: str) -> Context:
+        """A context for code of `module`."""
         return Context(
             actor=actor,
             now=self._clock(),
@@ -300,6 +371,11 @@ class Kernel:
             keys=keys,
             erasures=context.erasures,
         )
+
+
+def _authorise(actor: Actor, permission: str) -> None:
+    if not actor.may(permission):
+        raise Unauthorised(f"{actor.id} does not hold the permission {permission}")
 
 
 def _described(error: Exception) -> str:

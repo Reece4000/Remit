@@ -13,9 +13,11 @@ from .books import record
 from .model import (
     Account,
     AccountArchived,
+    AccountId,
     AccountOpened,
     AccountType,
     JournalEntry,
+    JournalEntryId,
     JournalEntryPosted,
     LedgerSettings,
     PeriodClose,
@@ -23,7 +25,7 @@ from .model import (
     Posting,
     module,
 )
-from .queries import balance, closed_through
+from .queries import AccountBalance, ClosedThrough, account_balance, closed_through
 
 
 class OpenAccount(Command[Account]):
@@ -34,7 +36,7 @@ class OpenAccount(Command[Account]):
 
 
 class ArchiveAccount(Command[Account]):
-    account_id: UUID
+    account_id: AccountId
 
 
 class PostJournalEntry(Command[JournalEntry]):
@@ -44,7 +46,7 @@ class PostJournalEntry(Command[JournalEntry]):
 
 
 class ReverseJournalEntry(Command[JournalEntry]):
-    entry_id: UUID
+    entry_id: JournalEntryId
     posting_date: date | None = None
     """Defaults to the original entry's date."""
 
@@ -67,7 +69,7 @@ def open_account(command: OpenAccount, context: Context) -> Account:
 def archive_account(command: ArchiveAccount, context: Context) -> Account:
     """Stop an account accepting postings. Its balance must be zero."""
     account = context.get(Account, command.account_id)
-    held = balance(context, account.id)
+    held = account_balance(AccountBalance(account_id=account.id), context)
     if not held.is_zero:
         raise Rejected(f"account {account.code} still holds a balance of {held.base}")
     archived = context.transition(account, "archive")
@@ -104,7 +106,7 @@ def reverse_journal_entry(command: ReverseJournalEntry, context: Context) -> Jou
 @module.command
 def close_period(command: ClosePeriod, context: Context) -> PeriodClose:
     """Close the books through a date. Nothing can then be posted on or before it."""
-    closed = closed_through(context)
+    closed = closed_through(ClosedThrough(), context)
     if closed and command.through <= closed:
         raise Rejected(f"the books are already closed through {closed}")
     close = context.create(PeriodClose(through=command.through))
@@ -120,7 +122,7 @@ def _post(
     *,
     reverses: UUID | None = None,
 ) -> JournalEntry:
-    closed = closed_through(context)
+    closed = closed_through(ClosedThrough(), context)
     if closed and posting_date <= closed:
         raise Rejected(
             f"the books are closed through {closed}; post on or after {closed + timedelta(days=1)}"

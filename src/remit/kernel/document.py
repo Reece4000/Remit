@@ -47,7 +47,9 @@ class Lifecycle:
 
 
 class Document(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    # A docstring under a field describes it wherever the registry describes the
+    # document: in the API's schema, on screen, and to agents.
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
 
     lifecycle: ClassVar[Lifecycle]
     unique: ClassVar[tuple[str, ...]] = ()
@@ -56,10 +58,20 @@ class Document(BaseModel):
     The kernel refuses a write that would duplicate one, and on PostgreSQL a unique index
     makes the database refuse it too.
     """
+    searchable: ClassVar[tuple[str, ...]] = ()
+    """Text fields a listing's `search` looks in, such as a code and a name.
+
+    A search finds the documents whose searchable text holds every word of it, whatever
+    the case or accents. See `remit.kernel.search`.
+    """
 
     id: UUID = Field(default_factory=uuid7)
+    """Identifies the document to the system, for good."""
     state: str = ""
+    """Where the document is in its lifecycle."""
     version: int = 0
+    """How many times the document has been written. Changes that name the version they
+    were read at are refused once it has moved on."""
 
     @model_validator(mode="before")
     @classmethod

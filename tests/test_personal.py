@@ -8,7 +8,7 @@ from typing import Annotated, Optional, TypedDict
 from uuid import UUID
 
 import pytest
-from conftest import kernel_on
+from conftest import ROOT, every, kernel_on
 from pydantic import BaseModel
 
 from remit.kernel import (
@@ -206,7 +206,7 @@ def club(store: Store) -> Kernel:
 
 
 def inputs(kernel: Kernel) -> list[dict[str, object]]:
-    return [entry.input for entry in kernel.audit()]
+    return [entry.input for entry in kernel.audit(actor=ROOT)]
 
 
 def contact_details(kernel: Kernel) -> list[dict[str, object]]:
@@ -237,7 +237,7 @@ def test_an_entry_about_two_people_is_erased_with_either(club: Kernel) -> None:
     amy, bea = club.execute(JoinTogether(first="Amy", second="Bea"), actor=SECRETARY).result
     club.execute(Forget(member_id=amy.id), actor=SECRETARY)
     assert inputs(club)[0] == {"first": ERASED, "second": ERASED}
-    assert club.get(Member, bea.id).name == "Bea"
+    assert club.get(Member, bea.id, actor=ROOT).name == "Bea"
 
 
 def test_a_replay_is_answered_from_its_sealed_record(club: Kernel) -> None:
@@ -259,13 +259,13 @@ def test_a_replay_of_an_erased_subject_is_refused(club: Kernel) -> None:
 def test_personal_data_with_no_subject_to_erase_it_by_is_refused(club: Kernel) -> None:
     with pytest.raises(RemitError, match="writes no document it belongs to"):
         club.execute(PinWithName(name="Amy"), actor=SECRETARY)
-    assert club.find(Notice) == []
-    assert club.audit() == []
+    assert every(club, Notice) == []
+    assert club.audit(actor=ROOT) == []
 
 
 def test_a_dry_run_keeps_nothing(club: Kernel) -> None:
     club.execute(Join(name="Amy"), actor=SECRETARY, dry_run=True)
-    assert club.audit() == []
+    assert club.audit(actor=ROOT) == []
 
 
 def test_erasing_needs_the_live_document_blanked_first(club: Kernel) -> None:
@@ -277,7 +277,7 @@ def test_erasing_needs_the_live_document_blanked_first(club: Kernel) -> None:
 
 def test_only_documents_with_personal_data_can_be_erased(club: Kernel) -> None:
     notice = club.execute(Pin(text="AGM on Friday"), actor=SECRETARY).result
-    assert club.audit()[0].key is None
+    assert club.audit(actor=ROOT)[0].key is None
     with pytest.raises(RemitError, match="holds no personal data to erase"):
         club.execute(EraseNotice(notice_id=notice.id), actor=SECRETARY)
 
@@ -463,4 +463,4 @@ def test_an_erased_document_must_hold_nothing_personal_when_the_unit_commits(
 
     with pytest.raises(RemitError, match=r"replace people\.member's personal fields"):
         club.execute(ForgetThenRemember(member_id=amy.id), actor=SECRETARY)
-    assert club.get(Member, amy.id) == amy
+    assert club.get(Member, amy.id, actor=ROOT) == amy

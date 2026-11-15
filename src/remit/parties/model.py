@@ -28,11 +28,16 @@ from remit.kernel import (
     Module,
     Name,
     Personal,
+    References,
     SingleLine,
     Transition,
 )
 
 module = Module("parties")
+
+PartyId = Annotated[UUID, References("parties.party")]
+ContactId = Annotated[UUID, References("parties.contact")]
+AddressId = Annotated[UUID, References("parties.address")]
 
 Line = Name
 """One line of an address, or a phone number as written."""
@@ -65,6 +70,7 @@ class Party(Document):
         ),
     )
     unique = ("code",)
+    searchable = ("code", "name")
 
     code: Code
     kind: PartyKind
@@ -88,8 +94,9 @@ class Contact(Document):
     """Someone at a party, and how to reach them. Removed contacts keep their history."""
 
     lifecycle = _DETAIL
+    searchable = ("name", "email")
 
-    party_id: UUID
+    party_id: PartyId
     name: Annotated[Name, Personal]
     role: Name | None = None
     """What they do, such as Accounts payable or Site manager."""
@@ -102,8 +109,9 @@ class Address(Document):
     """A party's postal address. Formats differ by country, so only the country is structured."""
 
     lifecycle = _DETAIL
+    searchable = ("lines",)
 
-    party_id: UUID
+    party_id: PartyId
     label: Name
     """What the address is for, such as Billing, Delivery or Registered office."""
     lines: Annotated[tuple[Line, ...], Personal, Field(min_length=1, max_length=6)]
@@ -115,7 +123,7 @@ class Address(Document):
 class PartyRegistered(Event):
     """A party was registered."""
 
-    party_id: UUID
+    party_id: PartyId
     code: str
 
 
@@ -123,7 +131,7 @@ class PartyRegistered(Event):
 class PartyAmended(Event):
     """A party's details were changed. `changed` names the fields that differ."""
 
-    party_id: UUID
+    party_id: PartyId
     changed: tuple[str, ...]
 
 
@@ -131,36 +139,36 @@ class PartyAmended(Event):
 class PartyArchived(Event):
     """A party was archived."""
 
-    party_id: UUID
+    party_id: PartyId
 
 
 @module.event
 class PartyRestored(Event):
     """An archived party was made active again."""
 
-    party_id: UUID
+    party_id: PartyId
 
 
 @module.event
 class PartyErased(Event):
     """A person's personal data was erased, with their contacts and addresses."""
 
-    party_id: UUID
+    party_id: PartyId
 
 
 @module.event
 class ContactAdded(Event):
     """A contact was added to a party."""
 
-    contact_id: UUID
-    party_id: UUID
+    contact_id: ContactId
+    party_id: PartyId
 
 
 @module.event
 class ContactAmended(Event):
     """A contact's details were changed. `changed` names the fields that differ."""
 
-    contact_id: UUID
+    contact_id: ContactId
     changed: tuple[str, ...]
 
 
@@ -168,29 +176,29 @@ class ContactAmended(Event):
 class ContactRemoved(Event):
     """A contact was removed from a party."""
 
-    contact_id: UUID
+    contact_id: ContactId
 
 
 @module.event
 class ContactErased(Event):
     """A contact's personal data was erased."""
 
-    contact_id: UUID
+    contact_id: ContactId
 
 
 @module.event
 class AddressAdded(Event):
     """An address was added to a party."""
 
-    address_id: UUID
-    party_id: UUID
+    address_id: AddressId
+    party_id: PartyId
 
 
 @module.event
 class AddressAmended(Event):
     """An address was changed. `changed` names the fields that differ."""
 
-    address_id: UUID
+    address_id: AddressId
     changed: tuple[str, ...]
 
 
@@ -198,11 +206,11 @@ class AddressAmended(Event):
 class AddressRemoved(Event):
     """An address was removed from a party."""
 
-    address_id: UUID
+    address_id: AddressId
 
 
 @module.event
 class AddressErased(Event):
     """An address's personal data was erased."""
 
-    address_id: UUID
+    address_id: AddressId

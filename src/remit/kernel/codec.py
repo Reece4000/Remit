@@ -1,9 +1,6 @@
 """Translation between the kernel's typed objects and the JSON a store holds."""
 
-from collections.abc import Mapping
 from typing import Any
-
-from pydantic_core import to_jsonable_python
 
 from .document import Document
 from .errors import RemitError
@@ -11,6 +8,7 @@ from .message import Command, Event, Outcome, Recorded
 from .module import CommandSpec
 from .personal import DataKey, seal
 from .registry import Registry
+from .search import searched
 from .store import Json, StoredDocument, StoredEvent
 
 
@@ -23,24 +21,12 @@ class Codec:
         body = document.model_dump(mode="json")
         if type(document).model_validate(body) != document:
             raise RemitError(f"{name} {document.id} does not survive serialisation")
-        return StoredDocument(name, document.id, document.version, document.is_final, body)
+        fields = type(document).searchable
+        search = searched(body, fields) if fields else None
+        return StoredDocument(name, document.id, document.version, document.is_final, body, search)
 
     def load[D: Document](self, kind: type[D], body: Json) -> D:
         return kind.model_validate(body)
-
-    def filters(self, kind: type[Document], equals: Mapping[str, object]) -> dict[str, object]:
-        """`equals` as JSON scalars a store can match, refusing fields `kind` does not have.
-
-        A misspelt field must not quietly match everything, or nothing.
-        """
-        if unknown := sorted(equals.keys() - kind.model_fields.keys()):
-            name = self._registry.document_name(kind)
-            raise RemitError(f"cannot find {name} by {', '.join(unknown)}: it has no such field")
-        encoded = {field: to_jsonable_python(value) for field, value in equals.items()}
-        for field, value in encoded.items():
-            if isinstance(value, (dict, list)):
-                raise RemitError(f"cannot filter on {field}: only scalar fields can be matched")
-        return encoded
 
     def dump_event(self, event: Event) -> tuple[str, Json]:
         return self._registry.event_name(type(event)), event.model_dump(mode="json")

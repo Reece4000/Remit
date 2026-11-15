@@ -13,7 +13,16 @@ import psycopg
 import pytest
 
 from remit import items, ledger, parties
-from remit.kernel import Kernel, MemoryStore, Module, PostgresStore, Store
+from remit.kernel import (
+    Actor,
+    ActorKind,
+    Document,
+    Kernel,
+    MemoryStore,
+    Module,
+    PostgresStore,
+    Store,
+)
 
 DSN = os.environ.get("REMIT_TEST_DSN", "postgresql:///remit_test")
 
@@ -26,6 +35,29 @@ def kernel_on(store: Store, modules: Sequence[Module], **options: Any) -> Kernel
     if isinstance(store, PostgresStore):
         store.install(modules)
     return Kernel(modules, store=store, **options)
+
+
+ROOT = Actor(id="system:tests", kind=ActorKind.SYSTEM, permissions=frozenset({"*"}))
+"""Reads for the tests' own assertions: an actor who may read, and do, everything."""
+
+
+def every[D: Document](kernel: Kernel, kind: type[D], /, **equals: object) -> list[D]:
+    """Every document of a kind, read a page at a time as anyone outside the kernel must."""
+    found: list[D] = []
+    after = None
+    for _ in range(1000):
+        page = kernel.page(kind, actor=ROOT, where=equals, after=after, limit=200)
+        found += page.items
+        after = page.next
+        if after is None:
+            return found
+    raise AssertionError("the listing never came to an end")
+
+
+def rows(query: str) -> list[tuple[Any, ...]]:
+    """Read the database directly, as its administrator can."""
+    with psycopg.connect(DSN) as connection:
+        return connection.execute(query.encode()).fetchall()
 
 
 RECORDS = (
@@ -46,7 +78,8 @@ def empty_database() -> None:
         tables = [table.strip() for table in RECORDS.split(",")]
         for table in tables:
             connection.execute(f"ALTER TABLE {table} DISABLE TRIGGER never_truncated".encode())
-        connection.execute(f"TRUNCATE {RECORDS} RESTART IDENTITY".encode())
+        # What listings search is derived from the documents, and is emptied with them.
+        connection.execute(f"TRUNCATE {RECORDS}, document_search RESTART IDENTITY".encode())
         for table in tables:
             connection.execute(f"ALTER TABLE {table} ENABLE TRIGGER never_truncated".encode())
 

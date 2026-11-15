@@ -92,4 +92,8 @@ partly unreadable, but never the reverse.
   (a KMS) is on the roadmap.
 - **The live documents table and PostgreSQL's internals.** The live document is
   overwritten, but old row versions may persist in the database's own files until
-  vacuumed.
+  vacuumed. The same is true of what listings search (`document_search`), which holds
+  the text of each document's searchable fields, without case or accents. That row is
+  rewritten whenever its document is, so an erased name can no longer be searched for.
+- **Who may read personal data.** Anyone permitted to read a kind of document reads all
+  of its fields. Withholding personal fields from some readers is not built.

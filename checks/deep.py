@@ -23,7 +23,18 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
-from remit.kernel import Document, Money, kernel, module, money, personal, postgres, registry
+from remit.kernel import (
+    Document,
+    Money,
+    kernel,
+    module,
+    money,
+    personal,
+    postgres,
+    registry,
+    search,
+    selection,
+)
 from remit.kernel.context import Context
 from remit.ledger import books, commands
 
@@ -33,6 +44,8 @@ MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
 STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
 PERSONAL = ["tests/test_personal.py", "tests/test_parties.py"]
+REFERENCES = ["tests/test_references.py"]
+READS = ["tests/test_reads.py"]
 RACES = ["tests/test_postgres.py"]
 RACE_RUNS = 20
 
@@ -76,6 +89,18 @@ def rolled_back(unit: Any, commit: object) -> None:
     unit.rollback()
 
 
+def spaced(text: str) -> str:
+    return " ".join(text.split())
+
+
+def null_safe_equality_forgotten(statement: Any, field: str, value: Any, comparison: Any) -> Any:
+    if value is None or comparison is None or comparison is selection.Comparison.TEXT:
+        return statement.holding(field, value)
+    return postgres.sql.SQL("{} = {}").format(
+        statement.value(field, comparison), statement.given(value, comparison)
+    )
+
+
 MUTATIONS = [
     Mutation(
         "final documents can be changed",
@@ -91,6 +116,46 @@ MUTATIONS = [
         "unique values can be used twice",
         [*KERNEL, *LEDGER, *STANDARD],
         swap(Context, "_require_unique", nothing),
+    ),
+    Mutation(
+        "references can lead nowhere",
+        REFERENCES,
+        swap(Context, "_require_referenced", nothing),
+    ),
+    Mutation(
+        "references can lead to documents of modules not required",
+        REFERENCES,
+        swap(registry.Registry, "_check_references", nothing),
+    ),
+    Mutation(
+        "actors read and do what they hold no permission for",
+        [*KERNEL, *READS],
+        swap(kernel, "_authorise", nothing),
+    ),
+    Mutation(
+        "a query asked by a command is handed the means to write",
+        READS,
+        swap(Context, "_reading", lambda self: self),
+    ),
+    Mutation(
+        "search is thrown by case and accents",
+        READS,
+        swap(search, "fold", spaced),
+    ),
+    Mutation(
+        "a cursor is accepted by a listing that did not give it",
+        READS,
+        swap(selection.Selection, "_digest", lambda _: ""),
+    ),
+    Mutation(
+        "PostgreSQL and the memory store disagree about what a listing selects",
+        READS,
+        swap(postgres._Statement, "same", null_safe_equality_forgotten),  # pyright: ignore[reportPrivateUsage]
+    ),
+    Mutation(
+        "what is searched is not rebuilt when a module declares it differently",
+        READS,
+        swap(postgres, "_index_for_search", nothing),
     ),
     Mutation(
         "personal data is kept unsealed",
@@ -137,7 +202,7 @@ MUTATIONS = [
         LEDGER,
         swap(
             commands,
-            "balance",
+            "account_balance",
             lambda *_, **__: SimpleNamespace(is_zero=True, base=Money.zero("GBP")),
         ),
     ),
@@ -224,7 +289,7 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *MONEY, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *RACES]):
+    if not passes([*KERNEL, *MONEY, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *READS, *RACES]):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")

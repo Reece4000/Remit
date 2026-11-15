@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from conftest import DSN, kernel_on
+from conftest import DSN, ROOT, every, kernel_on, rows
 from test_kernel import AGENT, MoveTicket, Notice, OpenTicket, TicketResolved, desk
 
 from remit import items, ledger, parties
@@ -24,6 +24,8 @@ from remit.kernel import (
     Module,
     Money,
     PostgresStore,
+    Query,
+    Reader,
     Rejected,
     RemitError,
 )
@@ -186,12 +188,15 @@ def test_personal_data_is_stored_only_sealed(kernel: Kernel) -> None:
             "SELECT count(*) FROM data_key_subjects WHERE subject = %s", (amy.id,)
         ).fetchone() or (None,)
     assert left == 0
+    searched = " ".join(text for (text,) in rows("SELECT text FROM document_search"))
+    assert "p0001" in searched
+    assert "amy" not in searched, "what search reads is erased with the document"
 
 
 def test_pgledger_itself_refuses_a_transfer_into_a_closed_period(kernel: Kernel, accounts) -> None:
     post(kernel, accounts, date(2026, 3, 1))
     kernel.execute(ledger.ClosePeriod(through=date(2026, 3, 31)), actor=BOOKKEEPER)
-    [(bank,), (sales,)] = kernel.sql("SELECT id FROM pgledger_accounts_view ORDER BY name")
+    [(bank,), (sales,)] = rows("SELECT id FROM pgledger_accounts_view ORDER BY name")
 
     with (
         pytest.raises(psycopg.errors.CheckViolation, match="closed through 2026-03-31"),
@@ -205,12 +210,12 @@ def test_pgledger_itself_refuses_a_transfer_into_a_closed_period(kernel: Kernel,
 
 def test_a_balance_altered_behind_pgledgers_back_is_reported(kernel: Kernel, accounts) -> None:
     post(kernel, accounts, date(2026, 3, 1))
-    assert ledger.reconcile(kernel) == []
+    assert kernel.ask(ledger.Reconcile(), actor=ROOT) == []
 
     with psycopg.connect(DSN) as connection:
         connection.execute("UPDATE pgledger_accounts SET balance = 1000 WHERE name = '1200:GBP'")
 
-    assert ledger.reconcile(kernel) == [
+    assert kernel.ask(ledger.Reconcile(), actor=ROOT) == [
         "1200:GBP holds 1000 but its entries sum to 10.00",
         "GBP accounts sum to 990.00, not zero",
     ]
@@ -223,7 +228,7 @@ def test_one_account_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel
 
     assert sum(isinstance(result, ledger.Account) for result in results) == 1
     assert sum(isinstance(result, Rejected) for result in results) == 7
-    assert len(kernel.find(ledger.Account)) == 1
+    assert len(every(kernel, ledger.Account)) == 1
 
 
 def test_one_party_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
@@ -233,7 +238,7 @@ def test_one_party_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) 
 
     assert sum(isinstance(result, parties.Party) for result in results) == 1
     assert sum(isinstance(result, Rejected) for result in results) == 7
-    assert len(kernel.find(parties.Party)) == 1
+    assert len(every(kernel, parties.Party)) == 1
 
 
 def test_one_item_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -> None:
@@ -243,7 +248,7 @@ def test_one_item_code_is_won_by_exactly_one_of_many_claimants(kernel: Kernel) -
 
     assert sum(isinstance(result, items.Item) for result in results) == 1
     assert sum(isinstance(result, Rejected) for result in results) == 7
-    assert len(kernel.find(items.Item)) == 1
+    assert len(every(kernel, items.Item)) == 1
 
 
 def test_of_many_amendments_from_the_same_copy_exactly_one_lands(kernel: Kernel) -> None:
@@ -260,7 +265,7 @@ def test_of_many_amendments_from_the_same_copy_exactly_one_lands(kernel: Kernel)
 
     [landed] = [result for result in results if isinstance(result, parties.Party)]
     assert all("has changed since version 1" in str(r) for r in results if r is not landed)
-    assert kernel.get(parties.Party, amy.id) == landed
+    assert kernel.get(parties.Party, amy.id, actor=ROOT) == landed
 
 
 def test_an_entry_is_reversed_by_exactly_one_of_many_attempts(kernel: Kernel, accounts) -> None:
@@ -270,8 +275,8 @@ def test_an_entry_is_reversed_by_exactly_one_of_many_attempts(kernel: Kernel, ac
     results = race(8, lambda _: kernel.execute(reverse, actor=BOOKKEEPER).result)
 
     assert sum(isinstance(result, ledger.JournalEntry) for result in results) == 1
-    assert len(kernel.find(ledger.JournalEntry)) == 2
-    assert ledger.balance(kernel, accounts[0].id).is_zero
+    assert len(every(kernel, ledger.JournalEntry)) == 2
+    assert kernel.ask(ledger.AccountBalance(account_id=accounts[0].id), actor=ROOT).is_zero
 
 
 def test_a_retried_command_runs_once_however_many_copies_arrive(kernel: Kernel) -> None:
@@ -283,7 +288,7 @@ def test_a_retried_command_runs_once_however_many_copies_arrive(kernel: Kernel) 
 
     assert len({o.result.id for o in results if not isinstance(o, Rejected)}) == 1
     assert not any(isinstance(outcome, Rejected) for outcome in results)
-    assert len(kernel.audit()) == 1
+    assert len(kernel.audit(actor=ROOT)) == 1
 
 
 def test_nothing_is_posted_into_a_period_once_it_is_closed(kernel: Kernel, accounts) -> None:
@@ -302,14 +307,14 @@ def test_nothing_is_posted_into_a_period_once_it_is_closed(kernel: Kernel, accou
 
     accepted_in_total = sum(count for count in race(8, attempt) if isinstance(count, int))
 
-    log = kernel.events()
+    log = kernel.events(actor=ROOT)
     [closed_at] = [e.position for e in log if isinstance(e.event, ledger.PeriodClosed)]
     posted = [e.position for e in log if isinstance(e.event, ledger.JournalEntryPosted)]
     assert all(position < closed_at for position in posted)
-    assert len(posted) == accepted_in_total == len(kernel.find(ledger.JournalEntry))
-    assert kernel.sql("SELECT count(*) FROM pgledger_transfers") == [(accepted_in_total,)]
-    assert Money.total(ledger.trial_balance(kernel).values(), "GBP").is_zero
-    assert ledger.reconcile(kernel) == []
+    assert len(posted) == accepted_in_total == len(every(kernel, ledger.JournalEntry))
+    assert rows("SELECT count(*) FROM pgledger_transfers") == [(accepted_in_total,)]
+    assert Money.total(kernel.ask(ledger.TrialBalance(), actor=ROOT).values(), "GBP").is_zero
+    assert kernel.ask(ledger.Reconcile(), actor=ROOT) == []
 
 
 def test_many_workers_deliver_each_event_exactly_once(kernel: Kernel) -> None:
@@ -322,19 +327,37 @@ def test_many_workers_deliver_each_event_exactly_once(kernel: Kernel) -> None:
     results = race(6, lambda _: kernel.dispatch().delivered)
 
     assert sum(result for result in results if isinstance(result, int)) == 20
-    assert len(kernel.find(Notice)) == 20
-    assert len({notice.ticket_id for notice in kernel.find(Notice)}) == 20
+    assert len(every(kernel, Notice)) == 20
+    assert len({notice.ticket_id for notice in every(kernel, Notice)}) == 20
 
 
-def test_nothing_can_be_changed_through_the_kernels_reads(kernel: Kernel) -> None:
+# A module whose query tries to change things, as a careless or hostile one might.
+prying = Module("prying")
+
+
+class Tamper(Query[None]):
+    statement: str
+
+
+@prying.query
+def tamper(query: Tamper, reader: Reader) -> None:
+    """Run a statement through a read."""
+    reader.sql(query.statement)
+
+
+def test_nothing_can_be_changed_through_a_read(postgres: PostgresStore) -> None:
+    kernel = kernel_on(postgres, [desk, prying])
     ticket = kernel.execute(OpenTicket(subject="Printer"), actor=AGENT).result
 
-    with pytest.raises(RemitError, match="nothing can be changed through a read"):
-        kernel.sql('UPDATE documents SET body = body || \'{"subject": "Edited"}\'')
-    with pytest.raises(RemitError, match="nothing can be changed through a read"):
-        kernel.sql("INSERT INTO cursors (subscription, position) VALUES ('desk.x', 99)")
-    assert kernel.get(type(ticket), ticket.id) == ticket
-    assert len(kernel.audit()) == 1
+    for statement in (
+        'UPDATE documents SET body = body || \'{"subject": "Edited"}\'',
+        "INSERT INTO cursors (subscription, position) VALUES ('desk.x', 99)",
+        "DELETE FROM document_search",
+    ):
+        with pytest.raises(RemitError, match="nothing can be changed through a read"):
+            kernel.ask(Tamper(statement=statement), actor=ROOT)
+    assert kernel.get(type(ticket), ticket.id, actor=ROOT) == ticket
+    assert len(kernel.audit(actor=ROOT)) == 1
 
 
 # A module whose rule lives only in the database, as a trigger.
@@ -384,8 +407,8 @@ def test_a_dry_run_is_refused_by_rules_the_database_enforces(postgres: PostgresS
 
     preview = kernel.execute(KeepNote(text="shopping"), actor=AGENT_EVERYWHERE, dry_run=True)
     assert not preview.committed
-    assert kernel.find(Note) == []
-    assert kernel.audit() == []
+    assert every(kernel, Note) == []
+    assert kernel.audit(actor=ROOT) == []
 
 
 AGENT_EVERYWHERE = Actor(id="agent:all", kind=ActorKind.AGENT, permissions=frozenset({"*"}))
@@ -414,4 +437,4 @@ def test_a_delivery_the_database_refuses_does_not_stop_the_others(
     [failure] = dispatched.failures
     assert failure.subscription == "archivist.file_secretly"
     assert "secrets are not kept here" in failure.error
-    assert len(kernel.find(Notice)) == 1
+    assert len(every(kernel, Notice)) == 1
