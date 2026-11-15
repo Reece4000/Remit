@@ -37,7 +37,9 @@ entry in the audit trail.
   holding up any other.
 - **Everything is described by its own declarations.** Documents, lifecycles, commands
   and events are available as JSON Schema from the registry. A declaration without a
-  docstring does not register.
+  docstring does not register; a docstring under a field describes the field. A field
+  that holds another document's id says which kind of document, so a screen can offer
+  a choice of them and an agent knows what to look up.
 - **Personal data can be erased without rewriting history.** Fields marked personal are
   stored encrypted in the audit trail under keys that belong to the person they are
   about; erasing the person deletes the keys. See
@@ -200,6 +202,7 @@ which puts the posting in the same transaction as the document that caused it.
 | Nothing is posted into a closed period | The ledger's commands and a database trigger | Both of the above |
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
 | A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
+| A reference always leads to a document of the kind it names | The kernel, whenever a document is written; documents are never deleted | Writes referring to missing documents, from optional fields, tuples and nested models |
 | Codes and other unique values are never shared | A document's `unique` fields, checked by the kernel and indexed by the database | Threads racing for the same code, and direct inserts of a duplicate |
 | A module imports, and reacts to events from, only the modules it requires | An architecture test over every import; the registry, for subscriptions | Modules that try to react to undeclared events |
 | A module writes only its own documents and emits only its own events | The unit of work, which knows whose code is running | Commands and subscriptions that write another module's documents or emit its events |
@@ -209,7 +212,7 @@ which puts the posting in the same transaction as the document that caused it.
 | A migration, once applied, never changes | Each is recorded with a digest, and install refuses one that differs | Migrations edited after they were applied |
 | Every store refuses the same things | Shared field types refuse unprintable text, and every commit is checked for text PostgreSQL cannot store | The kernel's tests, run against both stores |
 
-`./check --deep` goes one step further: it breaks the framework in twenty-two ways, one
+`./check --deep` goes one step further: it breaks the framework in twenty-four ways, one
 at a time, and confirms the tests fail for each.
 
 Some things are trusted rather than checked, because modules are code you choose to

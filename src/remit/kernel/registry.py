@@ -14,6 +14,7 @@ from .errors import RegistrationError
 from .message import Command, Event
 from .module import CommandSpec, Module, Subscription, installation_order
 from .personal import carries_personal, unsealable, unsealable_result
+from .reference import declared, misplaced
 
 
 class Registry:
@@ -21,6 +22,7 @@ class Registry:
         """Register the modules and everything they require, dependencies first."""
         self.modules: dict[str, Module] = {}
         self._documents: dict[type[Document], str] = {}
+        self._document_types: dict[str, type[Document]] = {}
         self._document_owners: dict[type[Document], Module] = {}
         self._events: dict[type[Event], str] = {}
         self._event_owners: dict[type[Event], Module] = {}
@@ -36,6 +38,7 @@ class Registry:
                 _check_lifecycle(name, document)
                 _check_sealable(name, document)
                 self._documents[document] = name
+                self._document_types[name] = document
                 self._document_owners[document] = module
             for name, event in module.events.items():
                 _check_unclaimed(name, self._events.get(event))
@@ -66,6 +69,8 @@ class Registry:
         )
         for subscription in self.subscriptions:
             self._check_reach(subscription)
+        for module in self.modules.values():
+            self._check_references(module)
 
     def document_name(self, kind: type[Document]) -> str:
         return _resolve(self._documents, kind, "document")
@@ -89,7 +94,7 @@ class Registry:
         return _resolve(self._event_owners, kind, "event")
 
     def document_type(self, name: str) -> type[Document]:
-        return _resolve({name: kind for kind, name in self._documents.items()}, name, "document")
+        return _resolve(self._document_types, name, "document")
 
     def event_type(self, name: str) -> type[Event]:
         return _resolve({name: kind for kind, name in self._events.items()}, name, "event")
@@ -103,6 +108,25 @@ class Registry:
                 f"{subscription.name} reacts to {event}, "
                 f"but {module.name} does not require {owner.name}"
             )
+
+    def _check_references(self, module: Module) -> None:
+        """References name documents of the module or of those it requires, and sit on ids."""
+        reachable = (module, *module.requires)
+        names = {
+            name
+            for kind, name in self._documents.items()
+            if self._document_owners[kind] in reachable
+        }
+        commands = (spec.command for spec in module.commands.values())
+        for model in (*module.documents.values(), *module.events.values(), *commands):
+            if reason := misplaced(model):
+                raise RegistrationError(reason)
+            for where, document in declared(model):
+                if document not in names:
+                    raise RegistrationError(
+                        f"{where} refers to {document}, which is not a document of "
+                        f"{module.name} or of a module it requires"
+                    )
 
     def describe(self) -> dict[str, Any]:
         """Everything installed, as plain JSON-ready data."""

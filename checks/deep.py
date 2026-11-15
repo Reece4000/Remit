@@ -33,6 +33,7 @@ MODULES = ["tests/test_modules.py"]
 LEDGER = ["tests/test_ledger.py", "tests/test_ledger_properties.py"]
 STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
 PERSONAL = ["tests/test_personal.py", "tests/test_parties.py"]
+REFERENCES = ["tests/test_references.py"]
 RACES = ["tests/test_postgres.py"]
 RACE_RUNS = 20
 
@@ -91,6 +92,16 @@ MUTATIONS = [
         "unique values can be used twice",
         [*KERNEL, *LEDGER, *STANDARD],
         swap(Context, "_require_unique", nothing),
+    ),
+    Mutation(
+        "references can lead nowhere",
+        REFERENCES,
+        swap(Context, "_require_referenced", nothing),
+    ),
+    Mutation(
+        "references can lead to documents of modules not required",
+        REFERENCES,
+        swap(registry.Registry, "_check_references", nothing),
     ),
     Mutation(
         "personal data is kept unsealed",

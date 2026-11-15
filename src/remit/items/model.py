@@ -5,11 +5,25 @@ belongs to the modules concerned, which refer to the item by id.
 """
 
 from enum import StrEnum
+from typing import Annotated
 from uuid import UUID
 
-from remit.kernel import Code, Document, Event, Lifecycle, Module, Name, Text, Transition, UnitCode
+from remit.kernel import (
+    Code,
+    Document,
+    Event,
+    Lifecycle,
+    Module,
+    Name,
+    References,
+    Text,
+    Transition,
+    UnitCode,
+)
 
 module = Module("items")
+
+ItemId = Annotated[UUID, References("items.item")]
 
 Description = Text
 
@@ -53,7 +67,7 @@ class Item(Document):
 class ItemAdded(Event):
     """An item was added."""
 
-    item_id: UUID
+    item_id: ItemId
     code: str
 
 
@@ -61,7 +75,7 @@ class ItemAdded(Event):
 class ItemAmended(Event):
     """An item's name or description was changed. `changed` names the fields that differ."""
 
-    item_id: UUID
+    item_id: ItemId
     changed: tuple[str, ...]
 
 
@@ -69,11 +83,11 @@ class ItemAmended(Event):
 class ItemDiscontinued(Event):
     """An item was discontinued."""
 
-    item_id: UUID
+    item_id: ItemId
 
 
 @module.event
 class ItemReinstated(Event):
     """A discontinued item was made active again."""
 
-    item_id: UUID
+    item_id: ItemId

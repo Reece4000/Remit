@@ -15,11 +15,11 @@ from .document import Document
 class Command[R](BaseModel):
     # Unknown fields are refused, not ignored: a caller who names a field that does not
     # exist (or cannot be changed) must be told, not left believing it took effect.
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", use_attribute_docstrings=True)
 
 
 class Event(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
 
 
 @dataclass(frozen=True)

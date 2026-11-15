@@ -13,9 +13,11 @@ from .books import record
 from .model import (
     Account,
     AccountArchived,
+    AccountId,
     AccountOpened,
     AccountType,
     JournalEntry,
+    JournalEntryId,
     JournalEntryPosted,
     LedgerSettings,
     PeriodClose,
@@ -34,7 +36,7 @@ class OpenAccount(Command[Account]):
 
 
 class ArchiveAccount(Command[Account]):
-    account_id: UUID
+    account_id: AccountId
 
 
 class PostJournalEntry(Command[JournalEntry]):
@@ -44,7 +46,7 @@ class PostJournalEntry(Command[JournalEntry]):
 
 
 class ReverseJournalEntry(Command[JournalEntry]):
-    entry_id: UUID
+    entry_id: JournalEntryId
     posting_date: date | None = None
     """Defaults to the original entry's date."""
 

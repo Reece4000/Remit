@@ -26,6 +26,7 @@ from .document import Document
 from .errors import NotFound, Problem, Rejected, RemitError, invalid
 from .message import Command, Event
 from .personal import carries_personal, unerased
+from .reference import references
 from .registry import Registry
 from .store import Unit
 
@@ -254,6 +255,19 @@ class Context:
                 "work; use the copy that change returned"
             )
 
+    def _require_referenced(self, document: Document) -> None:
+        for found in references(document):
+            try:
+                self._get(self._registry.document_type(found.document), found.id)
+            except NotFound:
+                name = self._registry.document_name(type(document))
+                where = ".".join(map(str, found.path))
+                missing = f"there is no {found.document} with id {found.id}"
+                raise Rejected(
+                    f"{name} {where} refers to nothing: {missing}",
+                    problems=(Problem(found.path, missing, name),),
+                ) from None
+
     def _require_unique(self, document: Document) -> None:
         for field in document.unique:
             value = getattr(document, field)
@@ -271,6 +285,7 @@ class Context:
     def _write[D: Document](self, document: D) -> D:
         name = self._registry.document_name(type(document))
         self._require_owner(self._registry.document_owner(type(document)).name, f"write {name}")
+        self._require_referenced(document)
         self._require_unique(document)
         key = (type(document), document.id)
         read_version = self._read_versions.setdefault(key, document.version)

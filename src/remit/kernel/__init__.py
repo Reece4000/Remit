@@ -20,6 +20,7 @@ from .module import Migration, Module
 from .money import Currency, Money, minor_units
 from .personal import ERASED, Personal
 from .postgres import PostgresStore
+from .reference import References
 from .registry import Registry
 from .store import AuditEntry, MemoryStore, Store, Unit
 
@@ -54,6 +55,7 @@ __all__ = [
     "Problem",
     "Reader",
     "Recorded",
+    "References",
     "RegistrationError",
     "Registry",
     "Rejected",

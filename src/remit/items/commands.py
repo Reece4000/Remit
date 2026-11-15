@@ -1,7 +1,5 @@
 """The items module's commands, and how to look an item up."""
 
-from uuid import UUID
-
 from remit.kernel import Code, Command, Context, Name, NotFound, Reader, Rejected, UnitCode
 
 from .model import (
@@ -10,6 +8,7 @@ from .model import (
     ItemAdded,
     ItemAmended,
     ItemDiscontinued,
+    ItemId,
     ItemKind,
     ItemReinstated,
     module,
@@ -31,7 +30,7 @@ class AmendItem(Command[Item]):
     the description.
     """
 
-    item_id: UUID
+    item_id: ItemId
     version: int
     """The version these details were read at. Refused if the item has changed since."""
     name: Name
@@ -39,11 +38,11 @@ class AmendItem(Command[Item]):
 
 
 class DiscontinueItem(Command[Item]):
-    item_id: UUID
+    item_id: ItemId
 
 
 class ReinstateItem(Command[Item]):
-    item_id: UUID
+    item_id: ItemId
 
 
 @module.command

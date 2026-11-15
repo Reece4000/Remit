@@ -50,6 +50,7 @@ class Ticket(Document):
 
     subject: str
     resolution: str | None = None
+    """What was done about it."""
 
 
 @desk.document
@@ -70,6 +71,7 @@ class TicketResolved(Event):
 
 class OpenTicket(Command[Ticket]):
     subject: str
+    """What the request is about, in a few words."""
 
 
 class RenameTicket(Command[Ticket]):
@@ -308,7 +310,11 @@ def test_the_registry_describes_everything_a_module_declares(kernel: Kernel) -> 
     assert described["documents"]["desk.ticket"]["lifecycle"]["final"] == ["closed"]
     assert described["commands"]["desk.open_ticket"]["summary"] == "Raise a ticket."
     assert described["commands"]["desk.open_ticket"]["returns"]["title"] == "Ticket"
-    assert "subject" in described["commands"]["desk.open_ticket"]["input"]["properties"]
+    opening = described["commands"]["desk.open_ticket"]["input"]["properties"]
+    assert opening["subject"]["description"] == "What the request is about, in a few words."
+    ticket = described["documents"]["desk.ticket"]["schema"]["properties"]
+    assert ticket["resolution"]["description"] == "What was done about it."
+    assert ticket["version"]["description"].startswith("How many times the document")
     assert described["subscriptions"] == [
         {
             "name": "desk.notify_requester",
