@@ -168,6 +168,18 @@ class Registry:
                         f"{module.name} or of a module it requires"
                     )
 
+    def permissions(self) -> list[str]:
+        """Every permission there is to hold, for what is installed: each command by name,
+        each read as `<module>.read.<name>`, then the audit trail's and the event log's."""
+        modules = self.modules.values()
+        return [
+            *(name for module in modules for name in module.commands),
+            *(read_permission(name) for module in modules for name in module.documents),
+            *(spec.permission for module in modules for spec in module.queries.values()),
+            READ_AUDIT,
+            READ_EVENTS,
+        ]
+
     def describe(self) -> dict[str, Any]:
         """Everything installed, as plain JSON-ready data.
 
@@ -236,8 +248,11 @@ def _check_lifecycle(name: str, document: type[Document]) -> None:
     lifecycle = getattr(document, "lifecycle", None)
     if lifecycle is None:
         raise RegistrationError(f"{name} declares no lifecycle")
-    if unknown := [field for field in document.unique if field not in document.model_fields]:
+    together = document.unique_together()
+    if unknown := [f for fields in together for f in fields if f not in document.model_fields]:
         raise RegistrationError(f"{name} declares unknown fields {unknown} unique")
+    if any(len(fields) == 0 or len(set(fields)) != len(fields) for fields in together):
+        raise RegistrationError(f"{name} declares a unique group that is empty or repeats a field")
     for transition in lifecycle.transitions:
         unknown = [field for field in transition.requires if field not in document.model_fields]
         if unknown:

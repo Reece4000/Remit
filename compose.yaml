@@ -1,0 +1,89 @@
+# Remit on one machine, as it runs in the cloud: PostgreSQL, an identity provider
+# (Keycloak), the API and a worker, each in its own container.
+#
+#   docker compose up --build
+#   docker compose run --rm api enrol "Your Name" --subject <your Keycloak user id>
+#
+# The API is at http://localhost:8000 (its OpenAPI document at /docs), Keycloak at
+# http://localhost:8080 (admin, admin). The realm `remit` has a user `owner` (password
+# `owner`) whose id is fixed, and an agent client `remit-agent`; see deploy/keycloak.
+# Every password here is for local use only.
+
+name: remit
+
+x-remit: &remit
+  build: .
+  environment:
+    REMIT_DATABASE: postgresql://remit:remit@database:5432/remit
+    REMIT_APPLICATION: remit.server.standard:application
+    REMIT_BASE_CURRENCY: GBP
+    # Tokens name the issuer by the address people reach it at; the server fetches its
+    # keys at the address containers reach it at.
+    REMIT_PROVIDERS: >-
+      [{"issuer": "http://localhost:8080/realms/remit", "audience": "remit",
+        "discovery": "http://identity:8080/realms/remit/.well-known/openid-configuration"}]
+    REMIT_INSECURE_PROVIDERS: "true"
+
+services:
+  database:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: remit
+      POSTGRES_PASSWORD: remit
+      POSTGRES_DB: remit
+    volumes:
+      - database:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username", "remit"]
+      interval: 2s
+      retries: 30
+
+  identity:
+    image: quay.io/keycloak/keycloak:26.8.2
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # One issuer for tokens wherever they are requested from, while containers still
+      # reach Keycloak by its own name for keys.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3 && grep -q UP <&3"]
+      interval: 3s
+      retries: 60
+
+  install:
+    <<: *remit
+    command: ["install"]
+    depends_on:
+      database:
+        condition: service_healthy
+
+  api:
+    <<: *remit
+    command: ["serve"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      install:
+        condition: service_completed_successfully
+      identity:
+        condition: service_healthy
+
+  worker:
+    <<: *remit
+    command: ["worker"]
+    healthcheck:
+      disable: true  # it serves nothing over HTTP
+    depends_on:
+      install:
+        condition: service_completed_successfully
+
+volumes:
+  database:

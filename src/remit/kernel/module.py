@@ -56,6 +56,8 @@ class QuerySpec:
     module: str
     query: type[Query[Any]]
     handler: Answer[Any, Any]
+    result: Any
+    """The return annotation, from which `returns` is built."""
     returns: TypeAdapter[Any]
     summary: str
 
@@ -146,7 +148,7 @@ class Module:
         query, result = _signature(handler, Query)
         name = self._claim(query.__name__, self._readable)
         self.queries[name] = QuerySpec(
-            name, self.name, query, handler, TypeAdapter(result), _summary(handler)
+            name, self.name, query, handler, result, TypeAdapter(result), _summary(handler)
         )
         return handler
 

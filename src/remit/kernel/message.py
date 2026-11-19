@@ -7,6 +7,7 @@ changes nothing. An event states that something did happen and cannot be refused
 
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
@@ -49,3 +50,34 @@ class Recorded:
     event: Event
     at: datetime
     actor: str
+
+
+@dataclass(frozen=True)
+class Change:
+    """One unit of work that wrote documents, as anyone who may read them may see it.
+
+    It names who acted and what they did, and the documents written that the reader may
+    read, each at the version it was written as. What was sent is in the audit trail,
+    for those who may read that.
+    """
+
+    position: int
+    """Where this sits in the audit trail."""
+    at: datetime
+    actor: str
+    action: str
+    """The command or subscription that ran."""
+    documents: tuple[tuple[str, UUID, int], ...]
+    """(kind, id, version) for each document written."""
+
+
+@dataclass(frozen=True)
+class Changes:
+    """A stretch of the changes feed.
+
+    `position` is where the stretch ends: pass it as `after` to read on. It moves on even
+    when nothing in the stretch was for this reader, so that reading on always advances.
+    """
+
+    items: tuple[Change, ...]
+    position: int

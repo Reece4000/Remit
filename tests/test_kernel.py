@@ -1,7 +1,7 @@
 """Kernel behaviour, exercised through a toy module that has nothing to do with accounting."""
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import UUID, uuid7
 
 import pytest
@@ -439,6 +439,81 @@ def test_unset_unique_values_do_not_collide(routes: Kernel) -> None:
     routes.execute(CreateQueue(code="IT"), actor=ROUTER)
     routes.execute(CreateQueue(code="HR"), actor=ROUTER)
     assert len(every(routes, Queue, email=None)) == 2
+
+
+# Fields unique together, through a rota where each person works one shift a day.
+
+rota = Module("rota")
+
+
+@rota.document
+class Shift(Document):
+    """A person's shift on a day."""
+
+    lifecycle = Lifecycle(initial="planned")
+    unique = (("person", "day"),)
+
+    person: str
+    day: date | None = None
+
+
+class PlanShift(Command[Shift]):
+    person: str
+    day: date | None = None
+
+
+@rota.command
+def plan_shift(command: PlanShift, context: Context) -> Shift:
+    """Plan a shift."""
+    return context.create(Shift(person=command.person, day=command.day))
+
+
+ROSTERER = Actor(id="rosterer", kind=ActorKind.HUMAN, permissions=frozenset({"rota.*"}))
+
+
+def test_fields_unique_together_may_each_repeat_but_not_both(store: Store) -> None:
+    kernel = kernel_on(store, [rota])
+    monday, tuesday = date(2026, 11, 16), date(2026, 11, 17)
+    kernel.execute(PlanShift(person="ana", day=monday), actor=ROSTERER)
+    kernel.execute(PlanShift(person="ana", day=tuesday), actor=ROSTERER)
+    kernel.execute(PlanShift(person="ben", day=monday), actor=ROSTERER)
+
+    with pytest.raises(Rejected, match=r"person and day \('ana', .*\) are already in use"):
+        kernel.execute(PlanShift(person="ana", day=monday), actor=ROSTERER)
+    with pytest.raises(Rejected) as refused:
+        kernel.execute(PlanShift(person="ben", day=monday), actor=ROSTERER)
+    assert refused.value.problems == (
+        Problem(("person",), "'ben' is already in use with the same person and day", "rota.shift"),
+        Problem(
+            ("day",),
+            "datetime.date(2026, 11, 16) is already in use with the same person and day",
+            "rota.shift",
+        ),
+    )
+    assert len(every(kernel, Shift)) == 3
+
+
+def test_fields_unique_together_do_not_collide_while_one_is_unset(store: Store) -> None:
+    kernel = kernel_on(store, [rota])
+    kernel.execute(PlanShift(person="ana"), actor=ROSTERER)
+    kernel.execute(PlanShift(person="ana"), actor=ROSTERER)
+    assert len(every(kernel, Shift)) == 2
+
+
+@pytest.mark.parametrize("unique", [((),), (("person", "person"),)])
+def test_a_unique_group_must_name_distinct_fields(unique: tuple[tuple[str, ...], ...]) -> None:
+    broken = Module("broken")
+
+    @broken.document
+    class Slot(Document):
+        """A slot."""
+
+        lifecycle = Lifecycle(initial="free")
+        person: str
+
+    Slot.unique = unique
+    with pytest.raises(RegistrationError, match="empty or repeats a field"):
+        Kernel([broken])
 
 
 # A module writes only its own documents and emits only its own events. Another module
