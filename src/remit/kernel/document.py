@@ -52,11 +52,13 @@ class Document(BaseModel):
     model_config = ConfigDict(frozen=True, use_attribute_docstrings=True)
 
     lifecycle: ClassVar[Lifecycle]
-    unique: ClassVar[tuple[str, ...]] = ()
+    unique: ClassVar[tuple[str | tuple[str, ...], ...]] = ()
     """Fields no two documents of this kind may share, whatever their state.
 
-    The kernel refuses a write that would duplicate one, and on PostgreSQL a unique index
-    makes the database refuse it too.
+    A tuple of fields is unique together: `("issuer", "subject")` lets two documents share
+    an issuer or a subject, but not both. A value left unset never collides. The kernel
+    refuses a write that would duplicate one, and on PostgreSQL a unique index makes the
+    database refuse it too.
     """
     searchable: ClassVar[tuple[str, ...]] = ()
     """Text fields a listing's `search` looks in, such as a code and a name.
@@ -91,3 +93,8 @@ class Document(BaseModel):
     @property
     def is_final(self) -> bool:
         return self.state in self.lifecycle.final
+
+    @classmethod
+    def unique_together(cls) -> tuple[tuple[str, ...], ...]:
+        """Each of `unique` as the fields that are unique together."""
+        return tuple((each,) if isinstance(each, str) else each for each in cls.unique)

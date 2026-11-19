@@ -8,7 +8,7 @@ snapshot no writer can invalidate, so it is never aborted and never aborts a wri
 
 import hashlib
 import json
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from importlib.resources import files
 from typing import Any, cast
@@ -25,7 +25,7 @@ from .module import Migration, Module, installation_order
 from .search import VERSION as SEARCH_VERSION
 from .search import holding_pattern, ranked_patterns, searched
 from .selection import Comparison, Condition, Selection, comparable
-from .store import AuditEntry, Commit, Json, StoredEvent, Unit
+from .store import AuditEntry, Commit, Json, Listener, StoredEvent, Unit
 
 _SQL = files(__package__).joinpath("sql")
 
@@ -39,12 +39,18 @@ _KERNEL_MIGRATIONS = (
         "0002-idempotency-per-actor", _SQL.joinpath("0002-idempotency-per-actor.sql").read_text()
     ),
     Migration("0003-search", _SQL.joinpath("0003-search.sql").read_text()),
+    Migration("0004-commit-order", _SQL.joinpath("0004-commit-order.sql").read_text()),
 )
 _KERNEL_RULES = _SQL.joinpath("rules.sql").read_text()
 
-# Held from the moment a unit records events until it commits, so that events become
-# visible in the same order as their positions and no subscriber can skip one.
-_EVENT_ORDER_LOCK = 7_154_697_431
+# Held from the moment a unit records its events and audit entry until it commits, so
+# that both become visible in the order of their positions and no reader following
+# either can skip one. Units therefore commit one at a time from that moment on, which
+# is a few statements and the commit itself.
+_COMMIT_ORDER_LOCK = 7_154_697_431
+
+_COMMITTED = "remit_committed"
+"""The channel every commit notifies, for whoever is listening."""
 
 # Held while installing, so that two installs cannot interleave their migrations.
 _INSTALL_LOCK = 7_154_697_432
@@ -64,6 +70,7 @@ class PostgresStore:
     runs_sql = True
 
     def __init__(self, dsn: str, *, connections: int = 10, timeout: float = 10.0) -> None:
+        self._dsn = dsn
         self._pool = ConnectionPool(
             dsn, min_size=1, max_size=connections, configure=_serialisable, open=False
         )
@@ -123,6 +130,13 @@ class PostgresStore:
 
     def close(self) -> None:
         self._pool.close()
+
+    @contextmanager
+    def listen(self) -> Generator[Listener]:
+        """A connection of its own, outside the pool, listening for commits."""
+        with Connection.connect(self._dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("LISTEN {}").format(sql.Identifier(_COMMITTED)))
+            yield _PostgresListener(connection)
 
     @contextmanager
     def unit(self, *, read_only: bool = False) -> Generator[Unit]:
@@ -206,15 +220,16 @@ def _record(connection: Connection[Any], owner: str, fingerprint: str) -> None:
     )
 
 
-def _unique_indexes(module: Module) -> dict[str, tuple[str, str]]:
-    """Index name to (document kind, field), for every unique field the module declares."""
-    indexes: dict[str, tuple[str, str]] = {}
+def _unique_indexes(module: Module) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Index name to (document kind, fields), for everything the module declares unique."""
+    indexes: dict[str, tuple[str, tuple[str, ...]]] = {}
     for kind, document in module.documents.items():
-        for field in document.unique:
-            name = f"{_UNIQUE_PREFIX}{kind}.{field}"
+        for fields in document.unique_together():
+            declared = f"{kind}.{'+'.join(fields)}"
+            name = f"{_UNIQUE_PREFIX}{declared}"
             if len(name.encode()) > _MAX_IDENTIFIER:
-                raise RegistrationError(f"{kind}.{field} is too long a name to index; shorten it")
-            indexes[name] = (kind, field)
+                raise RegistrationError(f"{declared} is too long a name to index; shorten it")
+            indexes[name] = (kind, fields)
     return indexes
 
 
@@ -235,12 +250,16 @@ def _install_unique_indexes(connection: Connection[Any], module: Module) -> None
     }
     for name in sorted(existing - declared.keys()):
         connection.execute(sql.SQL("DROP INDEX {name}").format(name=sql.Identifier(name)))
-    for name, (kind, field) in declared.items():
+    for name, (kind, fields) in declared.items():
+        # A value left unset reads as NULL, and NULLs never collide: as in the kernel.
+        values = sql.SQL(", ").join(
+            sql.SQL("(body ->> {field})").format(field=sql.Literal(field)) for field in fields
+        )
         connection.execute(
             sql.SQL(
-                "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON documents ((body ->> {field})) "
-                "WHERE kind = {kind}"
-            ).format(name=sql.Identifier(name), field=sql.Literal(field), kind=sql.Literal(kind))
+                "CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+                "ON documents ({values}) WHERE kind = {kind}"
+            ).format(name=sql.Identifier(name), values=values, kind=sql.Literal(kind))
         )
 
 
@@ -283,6 +302,23 @@ def _translated() -> Generator[None]:
         ) from refusal
     except _REFUSED as refusal:
         raise Rejected(f"the database refused this: {refusal.diag.message_primary}") from refusal
+
+
+def _wait_for_turn(execute: Callable[..., object]) -> None:
+    """Take the commit order lock, held until this unit's transaction ends."""
+    execute("SELECT pg_advisory_xact_lock(%s)", (_COMMIT_ORDER_LOCK,))
+
+
+class _PostgresListener:
+    def __init__(self, connection: Connection[Any]) -> None:
+        self._connection = connection
+
+    def wait(self, timeout: float) -> bool:
+        # Notifications that arrived since the last wait are delivered first, at once.
+        notified = self._connection.notifies(timeout=timeout, stop_after=1)
+        woke = next(notified, None) is not None
+        notified.close()
+        return woke
 
 
 class _PostgresUnit:
@@ -334,10 +370,22 @@ class _PostgresUnit:
         row = self._execute("SELECT secret FROM data_keys WHERE id = %s", (key,)).fetchone()
         return bytes(row[0]) if row else None
 
-    def audit(self) -> list[AuditEntry]:
-        rows = self._execute(
-            "SELECT at, actor, action, input, documents, events, cause, key FROM audit ORDER BY id"
-        ).fetchall()
+    def audit(
+        self, *, after: int = 0, document: tuple[str, UUID] | None = None, limit: int | None = None
+    ) -> list[AuditEntry]:
+        if document is None:
+            rows = self._execute(
+                "SELECT at, actor, action, input, documents, events, cause, key, id FROM audit "
+                "WHERE id > %s ORDER BY id LIMIT %s",
+                (after, limit),
+            ).fetchall()
+        else:
+            # Containment reaches into each [kind, id, version]: [kind, id] is held by it.
+            rows = self._execute(
+                "SELECT at, actor, action, input, documents, events, cause, key, id FROM audit "
+                "WHERE id > %s AND documents @> %s ORDER BY id LIMIT %s",
+                (after, Jsonb([[document[0], str(document[1])]]), limit),
+            ).fetchall()
         return [
             AuditEntry(
                 at=at,
@@ -348,8 +396,9 @@ class _PostgresUnit:
                 events=tuple(events),
                 cause=cause,
                 key=key,
+                position=position,
             )
-            for at, actor, action, input, documents, events, cause, key in rows
+            for at, actor, action, input, documents, events, cause, key, position in rows
         ]
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
@@ -392,13 +441,12 @@ class _PostgresUnit:
                 )
 
         audit = commit.audit
-        if commit.events:
-            execute("SELECT pg_advisory_xact_lock(%s)", (_EVENT_ORDER_LOCK,))
-            for name, body in commit.events:
-                execute(
-                    "INSERT INTO events (name, body, at, actor) VALUES (%s, %s, %s, %s)",
-                    (name, Jsonb(body), audit.at, audit.actor.id),
-                )
+        _wait_for_turn(execute)
+        for name, body in commit.events:
+            execute(
+                "INSERT INTO events (name, body, at, actor) VALUES (%s, %s, %s, %s)",
+                (name, Jsonb(body), audit.at, audit.actor.id),
+            )
         for data_key in commit.keys:
             execute(
                 "INSERT INTO data_keys (id, secret) VALUES (%s, %s)", (data_key.id, data_key.secret)
@@ -440,6 +488,8 @@ class _PostgresUnit:
                 "INSERT INTO idempotency (actor, key, record) VALUES (%s, %s, %s)",
                 (actor, key, Jsonb(record)),
             )
+        # Delivered when the transaction commits, and not at all if it does not.
+        execute("SELECT pg_notify(%s, '')", (_COMMITTED,))
 
 
 _CASTS = {

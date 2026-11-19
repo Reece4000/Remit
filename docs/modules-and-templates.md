@@ -1,7 +1,7 @@
 # Modules and templates
 
-Status: dependencies between modules are built, as are the first two standard modules
-(parties and items). Extensions, guards, links between lines and templates are designed
+Status: dependencies between modules are built, as are the first standard modules
+(parties, items, and access, through which people and agents sign in). Extensions, guards, links between lines and templates are designed
 here but not yet built.
 
 ## The rule

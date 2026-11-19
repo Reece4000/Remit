@@ -47,7 +47,8 @@ personal values.
 
 A document with personal fields is a **data subject**: its id identifies the person its
 personal data is about. In `parties`, that is a contact, an address, or a party that is
-a person.
+a person. In `access`, it is a member: their name, and the subject their identity
+provider knows them by.
 
 When a unit of work commits a command whose input or result carries personal values,
 the kernel:

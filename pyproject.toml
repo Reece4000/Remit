@@ -8,16 +8,25 @@ license-files = ["LICENSE", "src/remit/ledger/vendor/pgledger/LICENSE*"]
 requires-python = ">=3.14"
 dependencies = [
     "cryptography>=46",
+    "fastapi>=0.120",
+    "httpx2>=2.16",
     "iso4217>=1.16.20260101",
+    "joserfc>=1.4",
     "psycopg[binary,pool]>=3.2",
     "pycountry>=24.6",
+    "pydantic-settings>=2.11",
     "pydantic[email]>=2.12",
+    "uvicorn>=0.38",
 ]
+
+[project.scripts]
+remit = "remit.server.cli:main"
 
 [dependency-groups]
 dev = [
     "coverage>=7.10",
     "hypothesis>=6.140",
+    "openapi-spec-validator>=0.7",
     "pip-audit>=2.9",
     "pyright>=1.1.400",
     "pytest>=8.4",
@@ -49,6 +58,8 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 "checks/**" = ["S101"]
+# The local Keycloak's users and client secret, published in deploy/keycloak for testing.
+"tests/test_keycloak.py" = ["S101", "S106"]
 
 [tool.coverage.run]
 branch = true
@@ -56,7 +67,7 @@ source = ["remit"]
 
 [tool.coverage.report]
 # A floor, not a target: raise it as gaps are closed, never lower it.
-fail_under = 98.6
+fail_under = 99.0
 precision = 1
 show_missing = true
 skip_covered = true

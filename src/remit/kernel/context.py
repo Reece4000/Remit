@@ -356,18 +356,12 @@ class Context(Reader):
                 ) from None
 
     def _require_unique(self, document: Document) -> None:
-        for field in document.unique:
-            value = getattr(document, field)
-            if value is None:
+        for fields in document.unique_together():
+            values = {field: getattr(document, field) for field in fields}
+            if any(value is None for value in values.values()):
                 continue
-            if any(
-                other.id != document.id for other in self.find(type(document), **{field: value})
-            ):
-                name = self._registry.document_name(type(document))
-                raise Rejected(
-                    f"{name} {field} {value!r} is already in use",
-                    problems=(Problem((field,), f"{value!r} is already in use", name),),
-                )
+            if any(other.id != document.id for other in self.find(type(document), **values)):
+                raise _taken(self._registry.document_name(type(document)), values)
 
     def _write[D: Document](self, document: D) -> D:
         name = self._registry.document_name(type(document))
@@ -397,3 +391,19 @@ class Context(Reader):
 
 def _blank(value: object) -> bool:
     return value is None or value == "" or (isinstance(value, (tuple, list)) and not value)
+
+
+def _taken(name: str, values: dict[str, object]) -> Rejected:
+    """The refusal of a value, or values unique together, that another document holds."""
+    if len(values) == 1:
+        ((field, value),) = values.items()
+        said = f"{value!r} is already in use"
+        return Rejected(f"{name} {field} {said}", problems=(Problem((field,), said, name),))
+    together = " and ".join(values)
+    return Rejected(
+        f"{name} {together} {tuple(values.values())!r} are already in use together",
+        problems=tuple(
+            Problem((field,), f"{value!r} is already in use with the same {together}", name)
+            for field, value in values.items()
+        ),
+    )

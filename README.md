@@ -3,8 +3,9 @@
 A framework for building business systems that people and AI agents operate through the
 same commands.
 
-> **Status: early.** The kernel, the ledger and the first standard modules (parties and
-> items) work and are heavily tested. There is no HTTP API yet. See [Roadmap](#roadmap).
+> **Status: early.** The kernel, the ledger, the first standard modules (parties, items
+> and access) and the REST API work and are heavily tested. There is no MCP server yet.
+> See [Roadmap](#roadmap).
 
 ## Why
 
@@ -34,6 +35,17 @@ entry in the audit trail.
   filters, searches, orders and pages any of them, and means the same on every store.
   Reads that take code, such as a trial balance, are declared as queries, with a
   docstring, a typed input and a typed result, exactly as commands are.
+- **Everything installed is served over HTTP, with nothing written for it.** Each
+  command, document and query gets its own route and its own types in the OpenAPI
+  document, so a client generated from it is typed throughout. Errors are problem
+  details that name each field at fault.
+- **Signing in is an identity provider's job; what someone may do is Remit's.** Any
+  OpenID Connect provider can vouch for who a person or agent is. Their roles are
+  documents in Remit, changed by commands, so every grant and revocation is in the audit
+  trail, and takes effect on the next request.
+- **What changes can be followed as it commits.** A feed of changes, which each reader
+  sees only as far as they may read, and a stream of it, tell a screen what to refresh.
+  Every document has a history: each unit of work that wrote it, and who did.
 - **Anything can be tried first.** A dry run executes a command for real and rolls it
   back, reporting what would have happened.
 - **Retries are safe.** A command an actor sends twice with the same idempotency key runs
@@ -252,6 +264,62 @@ It is registered as `shipping.overdue`, asked with `kernel.ask(Overdue(), actor=
 by an actor holding `shipping.read.overdue`, and asked by other modules' handlers with
 `context.ask(Overdue())`.
 
+## Serving
+
+The server runs the API, a worker that delivers events, and the setup around them, all
+from one container image. To run everything on one machine, with PostgreSQL and a
+Keycloak to sign in through:
+
+```sh
+docker compose up --build
+docker compose run --rm api enrol "Local Owner" --subject 0b9f6a3e-2c1d-4f5e-8a7b-1c2d3e4f5a6b
+```
+
+`enrol` makes the first member, holding every permission; they enrol everyone else
+through the API. The local Keycloak has a user `owner` (password `owner`) with that id,
+and an agent client, `remit-agent`, which signs in with its client credentials as an
+agent does. Its token goes in every request:
+
+```sh
+token=$(curl -s localhost:8080/realms/remit/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=remit-desktop -d username=owner -d password=owner \
+  | jq -r .access_token)
+
+curl -s localhost:8000/commands/parties.register_party \
+  -H "Authorization: Bearer $token" -H "Idempotency-Key: hollander-1" \
+  --json '{"code": "C0001", "kind": "organisation", "name": "Hollander Farms"}'
+
+curl -s "localhost:8000/documents/parties.party?search=hollander" -H "Authorization: Bearer $token"
+curl -sN localhost:8000/changes/stream -H "Authorization: Bearer $token"
+```
+
+| Route | What it does |
+|---|---|
+| `POST /commands/{name}` | Runs a command. `Idempotency-Key` makes a retry safe; `?dry_run=true` changes nothing. |
+| `GET /documents/{kind}` | Lists documents: `where` (JSON), `search`, `order`, `after`, `limit`. |
+| `GET /documents/{kind}/{id}` | Reads one, with its version as its `ETag`. `/history` lists what wrote it. |
+| `POST /queries/{name}` | Asks a query. It changes nothing; its input is a body. |
+| `GET /changes`, `GET /changes/stream` | Follows what is written, as pages or as server-sent events. |
+| `GET /audit`, `GET /events` | The audit trail, of everything or one document, and the event log. |
+| `GET /registry`, `GET /me` | What is installed, and who is asking and what they may do. |
+| `GET /openapi.json`, `GET /docs` | The OpenAPI 3.2 document, and a page to try it from. |
+
+In production the same image runs `remit serve`, `remit worker` and, on each release,
+`remit install`, configured from the environment:
+
+| Variable | Meaning |
+|---|---|
+| `REMIT_DATABASE` | The PostgreSQL connection string. |
+| `REMIT_APPLICATION` | What to run, as `package.module:name`: an `Application` naming the modules and their settings. `remit.server.standard:application` runs parties, items and the ledger, in `REMIT_BASE_CURRENCY`. |
+| `REMIT_PROVIDERS` | The identity providers trusted, as JSON: `[{"issuer": ..., "audience": ...}]`. The audience should name this API alone. `discovery` gives another address to fetch the provider's keys from, such as inside a private network. |
+| `REMIT_CONNECTIONS` | Database connections per process; ten by default. Scale by running more processes. |
+
+A token is accepted only from a trusted issuer, signed with an asymmetric algorithm by a
+key that issuer publishes, for the audience configured, with a subject, and in date.
+Keys are cached and fetched again when a provider rotates them, at most once every ten
+seconds however many unknown keys are sent. Providers on plain http are refused unless
+`REMIT_INSECURE_PROVIDERS` is set, which compose.yaml does for the local Keycloak.
+
 ## What is guaranteed, and how it is checked
 
 | Guarantee | Enforced by | Checked by |
@@ -269,7 +337,12 @@ by an actor holding `shipping.read.overdue`, and asked by other modules' handler
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
 | A change made from an out-of-date copy never overwrites a newer one | Amendments name the version they were read at | Threads amending the same party from the same copy |
 | A reference always leads to a document of the kind it names | The kernel, whenever a document is written; documents are never deleted | Writes referring to missing documents, from optional fields, tuples and nested models |
-| Codes and other unique values are never shared | A document's `unique` fields, checked by the kernel and indexed by the database | Threads racing for the same code, and direct inserts of a duplicate |
+| Codes and other unique values are never shared | A document's `unique` fields, alone or together, checked by the kernel and indexed by the database | Threads racing for the same code, direct inserts of a duplicate, and fields unique together that each repeat |
+| Anything following the changes feed or the audit trail by position never misses a commit | Every commit takes its turn from the moment it is numbered, so commits become visible in order | A unit held mid-commit while another tries to commit; writers racing a follower |
+| The changes feed shows each reader only what they may read | Each change lists only the documents of kinds the reader may read | Readers with and without those permissions, through the kernel and the API |
+| Only a token a trusted provider issued for this API, in date, signs anyone in | The verifier: issuer, asymmetric signature by a published key, audience, subject, expiry | Forged keys, the public key used as a shared secret, unsigned tokens, other audiences, expired tokens, rotated keys, and a real Keycloak |
+| A revoked role or a suspended member is refused from the next request | The access module signs the token's subject in on every request, and on every pass of a stream | Revocation and suspension between requests and during a stream |
+| No one grants, changes or takes away permissions they do not hold | The access module's commands | Managers defining, granting, widening and revoking above themselves |
 | A module imports, and reacts to events from, only the modules it requires | An architecture test over every import; the registry, for subscriptions | Modules that try to react to undeclared events |
 | A module writes only its own documents and emits only its own events | The unit of work, which knows whose code is running | Commands and subscriptions that write another module's documents or emit its events |
 | One subscription's failure never stops another's delivery | Each delivery is its own unit of work, and any error in it is recorded, not raised | Subscriptions that raise refusals and ordinary Python errors |
@@ -278,7 +351,7 @@ by an actor holding `shipping.read.overdue`, and asked by other modules' handler
 | A migration, once applied, never changes | Each is recorded with a digest, and install refuses one that differs | Migrations edited after they were applied |
 | Every store refuses the same things | Shared field types refuse unprintable text, and every commit is checked for text PostgreSQL cannot store | The kernel's tests, run against both stores |
 
-`./check --deep` goes one step further: it breaks the framework in thirty ways, one at a
+`./check --deep` goes one step further: it breaks the framework in forty ways, one at a
 time, and confirms the tests fail for each.
 
 Some things are trusted rather than checked, because modules are code you choose to
@@ -297,6 +370,9 @@ install:
 - A handler reads on the authority of what it is handling, in the same way: an actor
   who may ask for a trial balance need not also hold permission to read every account.
   What a command or a query gives back is therefore up to the module that wrote it.
+- Whoever can run `remit enrol` can make a member with every permission. They can reach
+  the database already, so this gives them nothing they lack, and it is how a business
+  locked out of its own access recovers.
 
 And some things reading does not do yet:
 
@@ -313,6 +389,18 @@ And some things reading does not do yet:
 - A listing does not count how many documents match.
 - Search does not forgive misspellings.
 
+And some things the server does not do yet:
+
+- It speaks plain HTTP, to be run behind a proxy or ingress that terminates TLS and
+  limits request rates, as a container platform provides.
+- A token revoked at the identity provider is accepted until it expires, since tokens
+  are checked by signature rather than by asking the provider. Suspending the member in
+  Remit takes effect at once, so keep access tokens short-lived.
+- When an agent acts, the audit trail names the agent, not who instructed it.
+- An actor can suspend themselves or revoke their own last role. `remit enrol` recovers.
+- Logs are plain lines. FastAPI can export traces, metrics and logs to OpenTelemetry
+  when it is configured to, but nothing here configures it.
+
 ## Getting started
 
 Requires Python 3.14, [uv](https://docs.astral.sh/uv/) and PostgreSQL. It is developed
@@ -323,16 +411,26 @@ createdb remit_test        # once; or point REMIT_TEST_DSN at another database
 ./check                    # creates .venv from uv.lock on first run
 ```
 
+To run the server, see [Serving](#serving); it needs only Docker.
+
 ## Testing
 
 `./check` is the gate. It installs exactly the versions in `uv.lock`, then runs format,
 lint (including security rules), strict type checking, the full test suite on
-PostgreSQL, and branch coverage against a floor that only ever rises. It takes about
-twenty seconds. There is no hosted CI.
+PostgreSQL, and branch coverage against a floor that only ever rises. It takes about a
+minute and a half. There is no hosted CI.
 
 `./check --deep` adds an audit of dependencies for known vulnerabilities, the mutation
-checks described above, and twenty repeats of the concurrency tests. It takes about a
-minute.
+checks described above, and twenty repeats of the concurrency tests. It takes a few
+minutes.
+
+The API's tests sign in through an identity provider with a real key pair, reached over
+in-memory HTTP. To sign in through a real Keycloak as well:
+
+```sh
+docker compose up -d identity
+REMIT_TEST_KEYCLOAK=http://localhost:8080 ./check
+```
 
 To run the gate before every push:
 
@@ -348,21 +446,25 @@ Kernel tests run in memory and on PostgreSQL; ledger tests need PostgreSQL. Runn
 | Path | Contents |
 |---|---|
 | `src/remit/kernel` | Business-agnostic mechanics: money, actors, documents, commands, events, the registry, the unit of work, and the memory and PostgreSQL stores. |
-| `src/remit/parties`, `src/remit/items` | Standard modules: the people and organisations a business deals with, and the goods and services it handles. |
+| `src/remit/parties`, `src/remit/items`, `src/remit/access` | Standard modules: the people and organisations a business deals with, the goods and services it handles, and the members and roles that sign in and act. |
 | `src/remit/ledger` | General ledger: accounts, journal entries, reversals, period closes. Built only on the kernel's public API. `books.py` is the bridge to pgledger, `rules.sql` holds what the database enforces, `vendor/pgledger` is pgledger v0.9.0 itself, unmodified. |
-| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands. |
+| `src/remit/server` | The REST API, token verification, the worker, and the `remit` command. A client of the kernel, built on public APIs only. |
+| `Dockerfile`, `compose.yaml`, `deploy` | The container image, everything running on one machine, and the local Keycloak's realm. |
+| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands; the API driven with signed tokens. |
 | `checks` | The mutation checks behind `./check --deep`. |
 | `docs` | Design notes: [modules and templates](docs/modules-and-templates.md), [personal data](docs/personal-data.md). |
 | `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. |
 
-Two layering rules are enforced by a test: the kernel imports no module, and a module
-imports only `remit.kernel` and the top-level packages of the modules it requires.
+Three layering rules are enforced by a test: the kernel imports no module, a module
+imports only `remit.kernel` and the top-level packages of the modules it requires, and
+the server imports only those public APIs.
 
 ## Roadmap
 
-1. **The outside surface.** A REST API and an MCP server, both generated from the
-   registry; audit by document and a feed of changes; a worker process for event
-   dispatch; authentication; a container image.
+1. **The outside surface.** Built: the REST API generated from the registry, sign-in
+   through OpenID Connect, audit by document, the changes feed, the worker and the
+   container image. Next: an MCP server generated from the registry in the same way, and
+   recording who instructed an agent.
 2. **Controls.** Roles, limits per role, approval steps and segregation of duties.
 3. **More kernel primitives.** Modules that add fields to, and refuse transitions of,
    documents they do not own; links between the lines of related

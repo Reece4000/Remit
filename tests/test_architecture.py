@@ -4,6 +4,9 @@ The kernel knows no module. Each module is a package that exposes its `Module` a
 `module`, and imports only the kernel's public API and the public API (the top-level
 package) of the modules it declares in `requires`. Standard modules get no access that a
 third party's module would not have.
+
+The server is not a module but a client of the kernel, as any other could be: it uses
+the kernel's public API and modules' public APIs, and nothing deeper.
 """
 
 import ast
@@ -20,7 +23,7 @@ ROOT = Path(remit.__file__).parent
 MODULES = sorted(
     path.name
     for path in ROOT.iterdir()
-    if path.is_dir() and path.name not in {"kernel", "__pycache__"}
+    if path.is_dir() and path.name not in {"kernel", "server", "__pycache__"}
 )
 
 
@@ -70,3 +73,9 @@ def test_a_module_imports_only_the_kernel_and_what_it_requires(package: str) -> 
 def test_a_standard_module_requires_only_standard_modules(package: str) -> None:
     for dependency in declared(package).requires:
         assert dependency is declared(dependency.name)
+
+
+def test_the_server_uses_only_public_apis() -> None:
+    public = {"remit.kernel", *(f"remit.{name}" for name in MODULES)}
+    beyond = [found for found in framework_imports("server") if found[1] not in public]
+    assert beyond == [], f"the server reaches past public APIs: {beyond}"

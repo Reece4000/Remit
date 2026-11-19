@@ -9,6 +9,7 @@ It also repeats the concurrency tests, because a race that passes once proves no
 """
 
 import contextlib
+import functools
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -23,7 +24,10 @@ import pytest
 from hypothesis import Phase, settings
 from psycopg import Connection, IsolationLevel
 
+from remit.access import commands as access
 from remit.kernel import (
+    Change,
+    Changes,
     Document,
     Money,
     kernel,
@@ -34,9 +38,11 @@ from remit.kernel import (
     registry,
     search,
     selection,
+    store,
 )
 from remit.kernel.context import Context
 from remit.ledger import books, commands
+from remit.server import app, auth
 
 KERNEL = ["tests/test_kernel.py"]
 MONEY = ["tests/test_money.py"]
@@ -46,12 +52,19 @@ STANDARD = ["tests/test_parties.py", "tests/test_items.py"]
 PERSONAL = ["tests/test_personal.py", "tests/test_parties.py"]
 REFERENCES = ["tests/test_references.py"]
 READS = ["tests/test_reads.py"]
-RACES = ["tests/test_postgres.py"]
+CHANGES = ["tests/test_changes.py"]
+ACCESS = ["tests/test_access.py"]
+API = ["tests/test_api.py"]
+SERVER = ["tests/test_server.py"]
+RACES = ["tests/test_postgres.py", "tests/test_changes.py"]
 RACE_RUNS = 20
 
 real_movements = books.movements
 real_order = module.installation_order
 real_unit = postgres.PostgresStore.unit
+real_audit = postgres._PostgresUnit.audit  # pyright: ignore[reportPrivateUsage]
+real_required = auth._required  # pyright: ignore[reportPrivateUsage]
+real_sign_in = app._sign_in  # pyright: ignore[reportPrivateUsage]
 
 
 def ignoring_version(self: Context, kind: type[Document], id: object, **_: object) -> Document:
@@ -99,6 +112,24 @@ def null_safe_equality_forgotten(statement: Any, field: str, value: Any, compari
     return postgres.sql.SQL("{} = {}").format(
         statement.value(field, comparison), statement.given(value, comparison)
     )
+
+
+def unfiltered(_: object, actor: object, entries: Any, after: int) -> Changes:
+    changes = tuple(Change(e.position, e.at, e.actor.id, e.action, e.documents) for e in entries)
+    return Changes(changes, entries[-1].position if entries else after)
+
+
+def every_entry(unit: Any, *, after: int = 0, document: object = None, limit: Any = None) -> Any:
+    return real_audit(unit, after=after, limit=limit)
+
+
+def each_field_alone(cls: type[Document]) -> tuple[tuple[str, ...], ...]:
+    fields = (f for each in cls.unique for f in ((each,) if isinstance(each, str) else each))
+    return tuple((field,) for field in fields)
+
+
+def any_audience(provider: Any) -> Any:
+    return {name: rule for name, rule in real_required(provider).items() if name != "aud"}
 
 
 MUTATIONS = [
@@ -269,6 +300,56 @@ MUTATIONS = [
         RACES,
         swap(postgres, "_serialisable", read_committed),
     ),
+    Mutation(
+        "fields unique together are each unique alone",
+        [*KERNEL, *ACCESS],
+        swap(Document, "unique_together", classmethod(each_field_alone)),
+    ),
+    Mutation(
+        "a later unit can commit before an earlier one it was numbered after",
+        CHANGES,
+        swap(postgres, "_wait_for_turn", nothing),
+    ),
+    Mutation(
+        "the changes feed shows documents the reader may not read",
+        [*CHANGES, *API],
+        swap(kernel.Kernel, "_changes", unfiltered),
+    ),
+    Mutation(
+        "a document's audit trail holds entries that did not write it",
+        CHANGES,
+        swap(postgres._PostgresUnit, "audit", every_entry),  # pyright: ignore[reportPrivateUsage]
+    ),
+    Mutation(
+        "listeners are not told of commits",
+        [*CHANGES, *SERVER],
+        swap(store._Commits, "announce", nothing),  # pyright: ignore[reportPrivateUsage]
+    ),
+    Mutation(
+        "members grant what they do not hold themselves",
+        ACCESS,
+        swap(access, "_require_holds", nothing),
+    ),
+    Mutation(
+        "a retired role still grants its permissions",
+        ACCESS,
+        swap(access, "_granted", lambda roles: [p for role in roles for p in role.permissions]),
+    ),
+    Mutation(
+        "tokens issued for another service are accepted",
+        API,
+        swap(auth, "_required", any_audience),
+    ),
+    Mutation(
+        "every token naming an unknown key makes the server fetch the keys again",
+        API,
+        swap(auth, "REFETCH_AT_MOST_EVERY", 0.0),
+    ),
+    Mutation(
+        "a revoked role or a suspended member is honoured until the server restarts",
+        API,
+        swap(app, "_sign_in", functools.cache(real_sign_in)),
+    ),
 ]
 
 
@@ -289,7 +370,21 @@ def main() -> int:
     settings.register_profile("deep", database=None, phases=[Phase.explicit, Phase.generate])
     settings.load_profile("deep")
 
-    if not passes([*KERNEL, *MONEY, *MODULES, *LEDGER, *STANDARD, *PERSONAL, *READS, *RACES]):
+    everything = [
+        *KERNEL,
+        *MONEY,
+        *MODULES,
+        *LEDGER,
+        *STANDARD,
+        *PERSONAL,
+        *READS,
+        *CHANGES,
+        *ACCESS,
+        *API,
+        *SERVER,
+        *RACES,
+    ]
+    if not passes(list(dict.fromkeys(everything))):
         print("FAILED    the tests do not pass before anything is broken; run ./check first")
         return 1
     print("ok        the tests pass before anything is broken")
