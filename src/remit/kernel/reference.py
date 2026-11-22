@@ -5,12 +5,15 @@ registry describes the field as a reference, so a screen can offer a choice of t
 documents and link to the one chosen, and an agent knows what to look up. And the
 kernel refuses to write a document whose reference leads nowhere: documents are never
 deleted, so a reference that was sound when written stays sound.
+
+A reference can also say which of those documents are worth offering, given what is
+beside it, as a lookup in an accounting system is narrowed by the record it is on.
 """
 
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from functools import cache
-from types import NoneType, UnionType
+from types import MappingProxyType, NoneType, UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
 from uuid import UUID
 
@@ -19,6 +22,7 @@ from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema
 
 _SCHEMA_KEY = "x-references"
+_WHERE_KEY = "x-where"
 
 
 @dataclass(frozen=True)
@@ -30,14 +34,38 @@ class References:
     the stored documents are. It must be a document of the module declaring the field,
     or of one it requires; the registry checks that at startup. The mark goes on the
     whole field, which may hold an id, an optional id, or a tuple or list of ids.
+
+    `where` narrows the documents a screen offers, and an agent looks among, to those
+    whose field holds what a path leads to:
+
+        sales_order_line_id: Annotated[UUID, References(
+            "sales.sales_order_line", where={"sales_order_id": "purchase_order_id.sales_order_id"}
+        )]
+
+    offers the lines of the sales order the purchase order was raised for. A path starts
+    at a field beside the reference and may go on, once, into the document that field
+    refers to. One that leads to nothing narrows nothing, so a purchase order raised for
+    stock is offered the lines of every order. It narrows what is offered, not what is
+    accepted: the command still decides that. The registry checks at startup that each
+    path can be followed and that the documents offered hold the field compared.
     """
 
     document: str
+    where: Mapping[str, str] = field(default_factory=dict[str, str])
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "where", MappingProxyType(dict(self.where)))
+
+    def __hash__(self) -> int:
+        return hash((self.document, tuple(self.where.items())))
 
     def __get_pydantic_json_schema__(
         self, core_schema: CoreSchema, handler: GetJsonSchemaHandler
     ) -> JsonSchemaValue:
-        return {**handler(core_schema), _SCHEMA_KEY: self.document}
+        schema = {**handler(core_schema), _SCHEMA_KEY: self.document}
+        if self.where:
+            schema[_WHERE_KEY] = dict(self.where)
+        return schema
 
 
 @dataclass(frozen=True)
@@ -80,6 +108,70 @@ def misplaced(model: type[BaseModel]) -> str | None:
             if reason := misplaced(nested):
                 return reason
     return None
+
+
+def unnarrowable(model: type[BaseModel], documents: Mapping[str, type[BaseModel]]) -> str | None:
+    """Why a reference's `where`, in the model or a model nested in it, cannot be followed.
+
+    `documents` are the documents registered, by name. A document not among them is
+    reported by the check of what references lead to, so it is passed over here.
+    """
+    for name, info in model.model_fields.items():
+        where = f"{model.__name__}.{name}"
+        for mark in info.metadata:
+            if not isinstance(mark, References):
+                continue
+            offered = documents.get(mark.document)
+            for compared, path in mark.where.items():
+                if offered is not None and compared not in offered.model_fields:
+                    return f"{where} is narrowed by {compared}, which {mark.document} does not hold"
+                if reason := _unfollowable(model, path, documents):
+                    return f"{where} is narrowed by {path}, {reason}"
+        for nested in _models_in(info.annotation):
+            if reason := unnarrowable(nested, documents):
+                return reason
+    return None
+
+
+def _unfollowable(
+    model: type[BaseModel], path: str, documents: Mapping[str, type[BaseModel]]
+) -> str | None:
+    """Why a path cannot be followed from the model, if it cannot."""
+    first, *rest = path.split(".")
+    if first not in model.model_fields:
+        return f"but {model.__name__} has no field {first}"
+    if not rest:
+        return None
+    if len(rest) > 1:
+        return "but a path goes into one document at most"
+    through = _refers_once(model, first)
+    if through is None:
+        return f"but {first} does not hold the id of a document"
+    held = documents.get(through)
+    if held is not None and rest[0] not in held.model_fields:
+        return f"but {through} has no field {rest[0]}"
+    return None
+
+
+def _refers_once(model: type[BaseModel], field: str) -> str | None:
+    """The document a field holds the id of, if it holds one id or none."""
+    info = model.model_fields[field]
+    annotation = info.annotation
+    union = get_origin(annotation) in (Union, UnionType)
+    if annotation is not UUID and not (union and set(get_args(annotation)) == {UUID, NoneType}):
+        return None
+    return next((mark.document for mark in info.metadata if isinstance(mark, References)), None)
+
+
+def refers_to(model: type[BaseModel], field: str) -> str | None:
+    """The document a field of the model holds the id of, if it holds exactly one.
+
+    Not an optional id, nor a tuple or list of ids: one document, always there.
+    """
+    info = model.model_fields[field]
+    if info.annotation is not UUID:
+        return None
+    return next((mark.document for mark in info.metadata if isinstance(mark, References)), None)
 
 
 def references(value: BaseModel) -> list[Found]:

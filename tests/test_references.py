@@ -53,7 +53,7 @@ class Book(Document):
     shelf_id: ShelfId
     """Where the book is now."""
     returned_to: Annotated[UUID | None, References("library.shelf")] = None
-    moves: tuple[Move, ...] = ()
+    history: tuple[Move, ...] = ()
     see_also: Annotated[tuple[UUID, ...], References("library.book")] = ()
 
 
@@ -61,7 +61,7 @@ class ShelveBook(Command[Book]):
     title: str
     shelf_id: ShelfId
     returned_to: UUID | None = None
-    moves: tuple[Move, ...] = ()
+    history: tuple[Move, ...] = ()
     see_also: tuple[UUID, ...] = ()
 
 
@@ -118,7 +118,7 @@ def test_a_document_whose_reference_leads_nowhere_is_refused(kernel: Kernel) -> 
     ("shape", "path"),
     [
         ("optional", ("returned_to",)),
-        ("nested", ("moves", 1, "shelf_id")),
+        ("nested", ("history", 1, "shelf_id")),
         ("tuple", ("see_also", 0)),
     ],
 )
@@ -128,7 +128,7 @@ def test_references_are_followed_into_optional_fields_tuples_and_nested_models(
     nowhere = uuid7()
     changes: dict[str, dict[str, object]] = {
         "optional": {"returned_to": nowhere},
-        "nested": {"moves": (Move(shelf_id=shelf), Move(shelf_id=nowhere))},
+        "nested": {"history": (Move(shelf_id=shelf), Move(shelf_id=nowhere))},
         "tuple": {"see_also": (nowhere,)},
     }
     command = ShelveBook.model_validate({"title": "T", "shelf_id": shelf, **changes[shape]})
@@ -145,7 +145,7 @@ def test_sound_references_of_every_shape_are_written(kernel: Kernel, shelf: UUID
         title="Second",
         shelf_id=shelf,
         returned_to=shelf,
-        moves=(Move(shelf_id=shelf),),
+        history=(Move(shelf_id=shelf),),
         see_also=(first.id,),
     )
     assert kernel.execute(command, actor=LIBRARIAN).result.see_also == (first.id,)
@@ -235,3 +235,65 @@ def test_a_mark_on_a_field_that_holds_no_ids_is_refused(annotation: object) -> N
 
     with pytest.raises(RegistrationError, match=r"Find\.book is marked as a reference but"):
         Registry([catalogue])
+
+
+class LendBook(Command[Book]):
+    shelf_id: ShelfId
+    book_id: Annotated[UUID, References("library.book", where={"shelf_id": "shelf_id"})]
+
+
+class SeeAlso(Command[Book]):
+    book_id: Annotated[UUID, References("library.book")]
+    other_id: Annotated[
+        UUID | None, References("library.book", where={"shelf_id": "book_id.shelf_id"})
+    ] = None
+
+
+def test_the_registry_describes_how_a_reference_is_narrowed() -> None:
+    lending = Module("lending", requires=(library,))
+
+    @lending.command
+    def lend_book(command: LendBook, context: Context) -> Book:
+        """Lend a book from a shelf."""
+        raise NotImplementedError
+
+    @lending.command
+    def see_also(command: SeeAlso, context: Context) -> Book:
+        """Suggest a book shelved beside another."""
+        raise NotImplementedError
+
+    commands = Registry([library, lending]).describe()["lending"]["commands"]
+    lent = commands["lending.lend_book"]["input"]["properties"]
+    assert lent["book_id"]["x-where"] == {"shelf_id": "shelf_id"}
+    seen = commands["lending.see_also"]["input"]["properties"]
+    assert seen["other_id"]["x-where"] == {"shelf_id": "book_id.shelf_id"}
+    assert "x-where" not in seen["book_id"]
+
+
+@pytest.mark.parametrize(
+    ("where", "refused"),
+    [
+        ({"label": "shelf_id"}, r"label, which library\.book does not hold"),
+        ({"shelf_id": "shelf"}, r"shelf, but Narrowed has no field shelf"),
+        ({"shelf_id": "note.shelf_id"}, r"note\.shelf_id, but note does not hold the id of"),
+        ({"shelf_id": "shelf_id.label.x"}, r"shelf_id\.label\.x, but a path goes into one"),
+        ({"shelf_id": "shelf_id.title"}, r"shelf_id\.title, but library\.shelf has no field"),
+    ],
+)
+def test_a_narrowing_that_cannot_be_followed_is_refused(
+    where: dict[str, str], refused: str
+) -> None:
+    lending = Module("lending", requires=(library,))
+
+    class Narrowed(Command[Book]):
+        shelf_id: ShelfId
+        note: str
+        book_id: Annotated[UUID, References("library.book", where=where)]
+
+    @lending.command
+    def lend_book(command: Narrowed, context: Context) -> Book:
+        """Lend a book from a shelf."""
+        raise NotImplementedError
+
+    with pytest.raises(RegistrationError, match=rf"Narrowed\.book_id is narrowed by {refused}"):
+        Registry([library, lending])

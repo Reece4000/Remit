@@ -2,8 +2,13 @@
 
 People and agents are the same kind of thing to the kernel. Both hold permissions, both
 are checked the same way, and both are named in the audit trail.
+
+The system acts too: when it is set up, when a server signs someone in, and when a
+module reacts to an event. Each time it acts under a name of its own, which its id is
+made from (`system:setup`), so that what it did can say in words who did it.
 """
 
+from collections.abc import Iterable
 from enum import StrEnum
 from fnmatch import fnmatchcase
 
@@ -33,3 +38,22 @@ class Actor(BaseModel):
 
     def may(self, permission: str) -> bool:
         return any(fnmatchcase(permission, pattern) for pattern in self.permissions)
+
+    @classmethod
+    def system(cls, name: str, *, permissions: Iterable[str] = ()) -> Actor:
+        """The system acting as `name`, such as `setup` or the module reacting to an
+        event, under the id `system:<name>`."""
+        return cls(id=f"{_SYSTEM}{name}", kind=ActorKind.SYSTEM, permissions=frozenset(permissions))
+
+
+_SYSTEM = "system:"
+
+
+def system_name(id: str) -> str | None:
+    """What the system acting under this id is called, in words, from the name the id is
+    made from: `Setup` for `system:setup`, `Kestrel stock` for `system:kestrel_stock`.
+    None for an id that is not the system's."""
+    name = id.removeprefix(_SYSTEM)
+    if name == id or not name:
+        return None
+    return name.replace("_", " ").capitalize()

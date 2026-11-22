@@ -29,6 +29,7 @@ from remit.kernel import (
     Store,
     Transition,
     Unauthorised,
+    system_name,
 )
 from remit.kernel.store import Commit, StoredDocument
 
@@ -295,6 +296,16 @@ def test_a_subscription_receives_each_event_once(kernel: Kernel, ticket: Ticket)
         "desk.notify_requester",
         1,
     )
+    assert system_name(delivery.actor.id) == "Desk"
+
+
+def test_the_system_is_named_in_words_from_the_name_it_acts_under() -> None:
+    setup = Actor(id="system:setup", kind=ActorKind.SYSTEM, permissions=frozenset({"*"}))
+    assert Actor.system("setup", permissions={"*"}) == setup
+    assert system_name("system:setup") == "Setup"
+    assert system_name("system:kestrel_stock") == "Kestrel stock"
+    for other in ("system:", "agent:desk", str(uuid7())):
+        assert system_name(other) is None
 
 
 def test_writing_from_a_stale_copy_is_refused(kernel: Kernel, ticket: Ticket) -> None:

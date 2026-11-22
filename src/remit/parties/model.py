@@ -95,6 +95,7 @@ class Contact(Document):
 
     lifecycle = _DETAIL
     searchable = ("name", "email")
+    part_of = "party_id"
 
     party_id: PartyId
     name: Annotated[Name, Personal]
@@ -110,6 +111,7 @@ class Address(Document):
 
     lifecycle = _DETAIL
     searchable = ("lines",)
+    part_of = "party_id"
 
     party_id: PartyId
     label: Name

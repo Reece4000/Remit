@@ -36,6 +36,7 @@ class OpenAccount(Command[Account]):
 
 
 class ArchiveAccount(Command[Account]):
+    moves = "archive"
     account_id: AccountId
 
 

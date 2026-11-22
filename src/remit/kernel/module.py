@@ -1,8 +1,9 @@
 """Modules: how a piece of the business declares itself to the kernel.
 
-A module is a plain object that collects document types, events, command and query
-handlers, and subscriptions. Everything else (permissions, the API, agent tools,
-documentation) is derived from these declarations, so each one must carry a docstring.
+A module is a plain object that collects document types, extensions to other modules'
+documents, events, command and query handlers, and subscriptions. Everything else
+(permissions, the API, agent tools, documentation) is derived from these declarations,
+so each one must carry a docstring.
 """
 
 import inspect
@@ -15,6 +16,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from .document import Document
 from .errors import RegistrationError
+from .extension import Extension
 from .message import Command, Event, Query
 
 if TYPE_CHECKING:
@@ -104,6 +106,7 @@ class Module:
         self.sql = sql
         """Rules the database enforces itself. Idempotent; reapplied on every install."""
         self.documents: dict[str, type[Document]] = {}
+        self.extensions: dict[str, type[Extension[Any]]] = {}
         self.events: dict[str, type[Event]] = {}
         self.commands: dict[str, CommandSpec] = {}
         self.queries: dict[str, QuerySpec] = {}
@@ -122,6 +125,12 @@ class Module:
         """Declare a document type."""
         _summary(kind)
         self.documents[self._claim(kind.__name__, self._readable)] = kind
+        return kind
+
+    def extension[X: Extension[Any]](self, kind: type[X]) -> type[X]:
+        """Declare fields this module adds to a document of a module it requires."""
+        _summary(kind)
+        self.extensions[self._claim(kind.__name__, self.extensions)] = kind
         return kind
 
     def event[E: Event](self, kind: type[E]) -> type[E]:

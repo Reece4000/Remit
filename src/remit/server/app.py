@@ -6,12 +6,15 @@ one with its own types:
 
 - `POST /commands/{name}` runs a command. `Idempotency-Key` makes a retry safe, and
   `?dry_run=true` reports what it would do without doing it.
-- `GET /documents/{kind}` lists documents (`where`, `search`, `order`, `after`, `limit`),
-  `GET /documents/{kind}/{id}` reads one, and `.../history` lists what wrote it.
+- `GET /documents/{kind}` lists documents (`where`, `search`, `order`, `after`, `limit`)
+  and says how many there are in all, `GET /documents/{kind}/values/{field}` counts the
+  values a field holds across a listing, `GET /documents/{kind}/{id}` reads one, and
+  `.../history` lists what wrote it.
 - `POST /queries/{name}` asks a query. It changes nothing; it is a POST because its
   input is a body.
 - `GET /changes` follows what is written, and `GET /changes/stream` sends it as it
-  commits, as server-sent events.
+  commits, as server-sent events. Each change, there and in a document's history, names
+  who made it.
 - `GET /audit` and `GET /events` read the audit trail and the event log.
 - `GET /registry` describes what is installed, and `GET /me` who is asking and what
   they may do.
@@ -50,9 +53,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from remit import access
 from remit.kernel import (
     DEFAULT_LIMIT,
+    DEFAULT_VALUES,
     MAX_LIMIT,
+    MAX_VALUES,
     Actor,
     ActorKind,
+    Changes,
     CommandSpec,
     ConcurrencyError,
     Document,
@@ -64,6 +70,7 @@ from remit.kernel import (
     RemitError,
     Unauthorised,
     said,
+    system_name,
 )
 
 from .auth import Identity, Unauthenticated, Verifier
@@ -79,7 +86,9 @@ from .wire import (
     FieldProblem,
     Listed,
     Me,
+    PositionSent,
     ProblemSent,
+    ValuesSent,
     Written,
 )
 
@@ -118,8 +127,9 @@ class _Served:
     verifier: Verifier
     commits: Commits
     heartbeat: float
-    signing_in: Actor
-    """The server's own actor. It may ask who a token's subject is, and nothing more."""
+    server: Actor
+    """The server's own actor. It may ask who a token's subject is, and what the actors
+    of the changes it shows are called, and nothing more."""
 
 
 def _served(request: Request) -> _Served:
@@ -143,7 +153,24 @@ def _sign_in(served: _Served, identity: Identity) -> Actor | None:
         asked = access.SignIn(issuer=identity.issuer, subject=identity.subject)
     except ValidationError:
         return None
-    return served.kernel.ask(asked, actor=served.signing_in)
+    return served.kernel.ask(asked, actor=served.server)
+
+
+def _named(served: _Served, changes: Changes) -> dict[str, str]:
+    """What the actors of these changes are called, by id: people and agents as the access
+    module names them, asked in one read for them all, and the system in words from its
+    ids. Actors with no name, such as members whose names were erased, are left out."""
+    named: dict[str, str] = {}
+    members: set[str] = set()
+    for change in changes.items:
+        if change.actor_kind is not ActorKind.SYSTEM:
+            members.add(change.actor)
+        elif (called := system_name(change.actor)) is not None:
+            named[change.actor] = called
+    if members:
+        asked = access.ActorNames(actors=tuple(sorted(members)))
+        named |= served.kernel.ask(asked, actor=served.server)
+    return named
 
 
 def _member(request: Request, identity: Annotated[Identity, Depends(_identity)]) -> Actor:
@@ -157,6 +184,13 @@ SignedIn = Annotated[Identity, Depends(_identity)]
 Member = Annotated[Actor, Depends(_member)]
 After = Annotated[int, Query(ge=0, description="Read on from this position.")]
 Limit = Annotated[int, Query(ge=1, le=MAX_LIMIT)]
+Where = Annotated[
+    str | None,
+    Query(
+        description='A JSON object: `{"state": "active"}`, or with operators, '
+        '`{"weight": {"gte": 10}}`.'
+    ),
+]
 
 _system = APIRouter(tags=["system"])
 
@@ -202,9 +236,18 @@ def changes(
     """What has been written after a position, in commit order.
 
     Lists only the documents the reader may read, and leaves out work that wrote none of
-    them. The position moves on regardless, so reading on always advances.
+    them. The position moves on regardless, so reading on always advances. Each change
+    names who made it.
     """
-    return ChangesSent.of(_served(request).kernel.changes(actor=actor, after=after, limit=limit))
+    served = _served(request)
+    found = served.kernel.changes(actor=actor, after=after, limit=limit)
+    return ChangesSent.of(found, _named(served, found))
+
+
+@_system.get("/changes/position", operation_id="changes_position")
+def position(request: Request, actor: Member) -> PositionSent:
+    """Where the changes feed has got to. Follow it from here to see only what is new."""
+    return PositionSent(position=_served(request).kernel.position(actor=actor))
 
 
 @_system.get("/changes/stream", operation_id="stream_changes", response_class=EventSourceResponse)
@@ -239,9 +282,10 @@ async def stream(
         stretch = await anyio.to_thread.run_sync(
             partial(kernel.changes, actor=actor, after=position, limit=MAX_LIMIT)
         )
+        names = await anyio.to_thread.run_sync(_named, served, stretch)
         for change in stretch.items:
             yield ServerSentEvent(
-                id=str(change.position), event="change", data=ChangeSent.of(change)
+                id=str(change.position), event="change", data=ChangeSent.of(change, names)
             )
         if stretch.position != position:
             position = stretch.position
@@ -318,12 +362,11 @@ def create_app(
     )
     # FastAPI describes the stream of changes with `itemSchema`, which is OpenAPI 3.2's.
     app.openapi_version = "3.2.0"
-    signing_in = Actor(
-        id="system:api",
-        kind=ActorKind.SYSTEM,
-        permissions=frozenset({kernel.registry.query(access.SignIn).permission}),
+    asks = (access.SignIn, access.ActorNames)
+    server = Actor.system(
+        "server", permissions=(kernel.registry.query(asked).permission for asked in asks)
     )
-    app.state.remit = _Served(kernel, verifier, commits, heartbeat, signing_in)
+    app.state.remit = _Served(kernel, verifier, commits, heartbeat, server)
     _handle_errors(app)
     app.add_middleware(_Hygiene, max_body=max_body)
     app.include_router(_system)
@@ -388,11 +431,13 @@ def _command_route(app: FastAPI, kernel: Kernel, spec: CommandSpec) -> None:
 def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Document]) -> None:
     summary = (kind.__doc__ or "").strip()
     tags: list[str | Enum] = [name.partition(".")[0]]
+    # Documents are read and listed with the fields their extensions add.
+    extended = kernel.registry.extended(kind)
 
     def read(
         id: UUID, actor: Actor, if_none_match: str | None, response: Response
     ) -> Document | Response:
-        document = kernel.get(kind, id, actor=actor)
+        document = kernel.get(extended, id, actor=actor)
         tag = f'"{document.version}"'
         if if_none_match is not None and tag in {t.strip() for t in if_none_match.split(",")}:
             return Response(status_code=304, headers={"ETag": tag})
@@ -401,7 +446,7 @@ def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Documen
 
     app.get(
         f"/documents/{name}/{{id}}",
-        response_model=kind,
+        response_model=extended,
         summary=f"Read a {name}",
         description=summary,
         operation_id=f"get_{_operation(name)}",
@@ -428,7 +473,7 @@ def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Documen
         limit: int,
     ) -> dict[str, Any]:
         page = kernel.page(
-            kind,
+            extended,
             actor=actor,
             where=_object("where", where),
             search=search,
@@ -436,11 +481,11 @@ def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Documen
             after=after,
             limit=limit,
         )
-        return {"items": page.items, "next": page.next}
+        return {"items": page.items, "next": page.next, "total": page.total}
 
     app.get(
         f"/documents/{name}",
-        response_model=Listed[kind],
+        response_model=Listed[extended],
         summary=f"List {name} documents",
         description=f"{summary}\n\nThe registry's `listing` says what can be filtered, "
         "ordered and searched.",
@@ -451,19 +496,16 @@ def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Documen
             listing,
             {
                 "actor": Member,
-                "where": (
+                "where": (Where, None),
+                "search": (Annotated[str | None, Query()], None),
+                "order": (
                     Annotated[
                         str | None,
                         Query(
-                            description='A JSON object: `{"state": "active"}`, or with '
-                            'operators, `{"weight": {"gte": 10}}`.'
+                            description="Fields separated by commas, most significant first, "
+                            "each with `-` before it for descending: `-received,code`."
                         ),
                     ],
-                    None,
-                ),
-                "search": (Annotated[str | None, Query()], None),
-                "order": (
-                    Annotated[str | None, Query(description="A field; `-field` for descending.")],
                     None,
                 ),
                 "after": (
@@ -475,20 +517,54 @@ def _document_routes(app: FastAPI, kernel: Kernel, name: str, kind: type[Documen
         )
     )
 
-    def history(id: UUID, actor: Actor, after: int, limit: int) -> ChangesSent:
-        return ChangesSent.of(kernel.history(kind, id, actor=actor, after=after, limit=limit))
+    def values(
+        field: str, actor: Actor, where: str | None, search: str | None, limit: int
+    ) -> ValuesSent:
+        found = kernel.values(
+            kind, field, actor=actor, where=_object("where", where), search=search, limit=limit
+        )
+        return ValuesSent.of(found)
+
+    # Before the history of a document, which would otherwise take `values/history` for it.
+    app.get(
+        f"/documents/{name}/values/{{field}}",
+        response_model=ValuesSent,
+        summary=f"Count the values in a field of {name} documents",
+        description="Each value the field holds in the documents `where` and `search` find, "
+        "with how many hold it: null first, then lowest to highest, as a filter's choices "
+        "are shown. Only fields a listing can filter on are counted; the registry's "
+        "`listing` names them.",
+        operation_id=f"values_{_operation(name)}",
+        tags=tags,
+    )(
+        _signed(
+            values,
+            {
+                "field": Annotated[str, Path()],
+                "actor": Member,
+                "where": (Where, None),
+                "search": (Annotated[str | None, Query()], None),
+                "limit": (Annotated[int, Query(ge=1, le=MAX_VALUES)], DEFAULT_VALUES),
+            },
+        )
+    )
+
+    def history(request: Request, id: UUID, actor: Actor, after: int, limit: int) -> ChangesSent:
+        found = kernel.history(kind, id, actor=actor, after=after, limit=limit)
+        return ChangesSent.of(found, _named(_served(request), found))
 
     app.get(
         f"/documents/{name}/{{id}}/history",
         response_model=ChangesSent,
         summary=f"What wrote a {name}",
-        description="Each unit of work that wrote the document, oldest first.",
+        description="Each unit of work that wrote the document, oldest first, with who did it.",
         operation_id=f"history_{_operation(name)}",
         tags=tags,
     )(
         _signed(
             history,
             {
+                "request": Request,
                 "id": Annotated[UUID, Path()],
                 "actor": Member,
                 "after": (Annotated[int, Query(ge=0)], 0),

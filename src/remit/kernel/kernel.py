@@ -8,10 +8,11 @@ Every unit is a serialisable transaction, so the checks a handler makes still ho
 it commits, whatever else is running. When the store cannot serialise a unit, the kernel
 runs it again; handlers only touch the context, which makes that safe.
 
-Reads (`get`, `page`, `ask`, `changes`, `history`, `events`, `audit`) name the actor
-who is reading, and are refused unless that actor holds the permission to read what is
-asked for. They run in read-only units: nothing can be changed through them, and on
-PostgreSQL they wait for a snapshot that can never conflict, so they are never aborted.
+Reads (`get`, `page`, `values`, `ask`, `changes`, `history`, `events`, `audit`) name
+the actor who is reading, and are refused unless that actor holds the permission to
+read what is asked for. They run in read-only units: nothing can be changed through
+them, and on PostgreSQL they wait for a snapshot that can never conflict, so they are
+never aborted.
 """
 
 import random
@@ -25,7 +26,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
-from .actor import Actor, ActorKind
+from .actor import Actor
 from .codec import Codec, unstorable
 from .context import Context, Reader
 from .document import Document
@@ -43,7 +44,7 @@ from .message import Change, Changes, Command, Outcome, Query, Recorded
 from .module import CommandSpec, Module, Subscription, read_permission
 from .personal import DataKey, carries_personal, seal, unseal
 from .registry import READ_AUDIT, READ_EVENTS, Registry
-from .selection import DEFAULT_LIMIT, MAX_LIMIT, Page
+from .selection import DEFAULT_LIMIT, DEFAULT_VALUES, MAX_LIMIT, Counted, Page, Values, tally
 from .store import AuditEntry, Commit, Json, MemoryStore, Store, SubjectKey, Unit
 
 
@@ -115,7 +116,7 @@ class Kernel:
                 return cast(Outcome[R], self._codec.load_outcome(spec, seen))
 
             context = self._context(unit, actor, spec.module)
-            result = spec.handler(command, context)
+            result = context.execute(command)
             context.finish()
             outcome = Outcome(result, context.written, context.emitted, committed=not dry_run)
             replay = (actor.id, idempotency_key, spec, outcome) if idempotency_key else None
@@ -173,7 +174,10 @@ class Kernel:
             raise invalid(name, error) from None
 
     def get[D: Document](self, kind: type[D], id: UUID, *, actor: Actor) -> D:
-        """A document by id, for an actor who may read documents of its kind."""
+        """A document by id, for an actor who may read documents of its kind.
+
+        Ask for `registry.extended(kind)` to read the fields its extensions add as well.
+        """
         _authorise(actor, self.registry.read_permission(kind))
         return self._read(lambda unit: self._reader(unit, actor).get(kind, id))
 
@@ -191,8 +195,10 @@ class Kernel:
         """One page of the documents of a kind, for an actor who may read them.
 
         `where` filters, `search` looks in the kind's searchable fields, `order` names
-        the field to sort by, and `after` takes the last page's `next`. See
-        `remit.kernel.selection`.
+        the fields to sort by, and `after` takes the last page's `next`. The page says
+        how many documents there are on every page together. See
+        `remit.kernel.selection`. Each reaches the fields the kind's extensions add as it
+        does the kind's own; ask for `registry.extended(kind)` to read those fields too.
         """
         _authorise(actor, self.registry.read_permission(kind))
         return self._read(
@@ -200,6 +206,31 @@ class Kernel:
                 kind, where=where, search=search, order=order, after=after, limit=limit
             )
         )
+
+    def values[D: Document](
+        self,
+        kind: type[D],
+        field: str,
+        *,
+        actor: Actor,
+        where: Mapping[str, object] | None = None,
+        search: str | None = None,
+        limit: int = DEFAULT_VALUES,
+    ) -> Values:
+        """The values a field holds across a listing, each with how many documents hold
+        it, for an actor who may read them: null first, then lowest to highest.
+
+        `where` and `search` select the documents as they do for `page`, and the field
+        must be one `where` can filter on: one of the kind's own, or one its extensions
+        add. See `remit.kernel.selection`.
+        """
+        _authorise(actor, self.registry.read_permission(kind))
+        name, extended = self.registry.document_name(kind), self.registry.extended(kind)
+        asked = tally(name, extended, field, where=where, search=search, limit=limit)
+        # One more than asked for, to learn whether any were left out.
+        found = self._read(lambda unit: unit.tally(replace(asked, limit=limit + 1)))
+        counted = tuple(Counted(value, count) for value, count in found[:limit])
+        return Values(counted, more=len(found) > limit)
 
     def ask[R](self, query: Query[R], *, actor: Actor) -> R:
         """Answer a query, for an actor who holds its permission."""
@@ -224,6 +255,13 @@ class Kernel:
         return self._read(
             lambda unit: self._changes(actor, unit.audit(after=after, limit=limit), after)
         )
+
+    def position(self, *, actor: Actor) -> int:
+        """Where the changes feed has got to: following it from here sees only what commits
+        after now. Like the feed, it needs no permission; it tells the actor only how many
+        units of work have committed."""
+        del actor  # named, as every read names who reads
+        return self._read(lambda unit: unit.position())
 
     def history[D: Document](
         self, kind: type[D], id: UUID, *, actor: Actor, after: int = 0, limit: int = DEFAULT_LIMIT
@@ -279,6 +317,7 @@ class Kernel:
                 entry.position,
                 entry.at,
                 entry.actor.id,
+                entry.actor.kind,
                 entry.action,
                 tuple(written for written in entry.documents if readable(written[0])),
             )
@@ -296,7 +335,7 @@ class Kernel:
         if not waiting:
             return False
         recorded = self._codec.load_event(waiting[0])
-        actor = Actor(id=f"system:{subscription.module}", kind=ActorKind.SYSTEM)
+        actor = Actor.system(subscription.module)
         context = self._context(unit, actor, subscription.module)
         try:
             subscription.handler(recorded.event, context)
@@ -397,7 +436,7 @@ class Kernel:
                 )
             keys = (SubjectKey(data_key.id, data_key.secret, subjects),)
 
-        documents = tuple(self._codec.dump(document) for document in context.written)
+        documents = context.stored
         events = tuple(self._codec.dump_event(event) for event in context.emitted)
         kept = [
             ("input", sealed_input),

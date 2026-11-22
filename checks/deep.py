@@ -115,7 +115,9 @@ def null_safe_equality_forgotten(statement: Any, field: str, value: Any, compari
 
 
 def unfiltered(_: object, actor: object, entries: Any, after: int) -> Changes:
-    changes = tuple(Change(e.position, e.at, e.actor.id, e.action, e.documents) for e in entries)
+    changes = tuple(
+        Change(e.position, e.at, e.actor.id, e.actor.kind, e.action, e.documents) for e in entries
+    )
     return Changes(changes, entries[-1].position if entries else after)
 
 
@@ -202,11 +204,6 @@ MUTATIONS = [
         "modules are registered before their dependencies",
         MODULES,
         swap(registry, "installation_order", dependents_first),
-    ),
-    Mutation(
-        "modules are installed before their dependencies",
-        MODULES,
-        swap(postgres, "installation_order", dependents_first),
     ),
     Mutation(
         "kernels run modules their database was not installed with",

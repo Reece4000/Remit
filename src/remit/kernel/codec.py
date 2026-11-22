@@ -9,6 +9,7 @@ from .module import CommandSpec
 from .personal import DataKey, seal
 from .registry import Registry
 from .search import searched
+from .selection import defaults
 from .store import Json, StoredDocument, StoredEvent
 
 
@@ -16,13 +17,16 @@ class Codec:
     def __init__(self, registry: Registry) -> None:
         self._registry = registry
 
-    def dump(self, document: Document) -> StoredDocument:
+    def dump(self, document: Document, *, extended: Json | None = None) -> StoredDocument:
+        """A document as a store keeps it, with what `extended` holds of its extensions'
+        fields beside its own."""
         name = self._registry.document_name(type(document))
-        body = document.model_dump(mode="json")
-        if type(document).model_validate(body) != document:
+        own = document.model_dump(mode="json")
+        if type(document).model_validate(own) != document:
             raise RemitError(f"{name} {document.id} does not survive serialisation")
-        fields = type(document).searchable
-        search = searched(body, fields) if fields else None
+        body = {**own, **(extended or {})}
+        kind = self._registry.extended(type(document))
+        search = searched({**defaults(kind), **body}, kind.searchable) if kind.searchable else None
         return StoredDocument(name, document.id, document.version, document.is_final, body, search)
 
     def load[D: Document](self, kind: type[D], body: Json) -> D:

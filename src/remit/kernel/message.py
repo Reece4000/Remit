@@ -7,10 +7,12 @@ changes nothing. An event states that something did happen and cannot be refused
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import ClassVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from .actor import ActorKind
 from .document import Document
 
 
@@ -18,6 +20,28 @@ class Command[R](BaseModel):
     # Unknown fields are refused, not ignored: a caller who names a field that does not
     # exist (or cannot be changed) must be told, not left believing it took effect.
     model_config = ConfigDict(frozen=True, extra="forbid", use_attribute_docstrings=True)
+
+    moves: ClassVar[str | None] = None
+    """The transition the command may take the document it acts on through, if any.
+
+    The document it acts on is the one its input refers to whose lifecycle has that
+    transition: `moves = "approve"` on a command given a purchase order's id. A screen
+    offers the command only where the transition can start, so approval only for draft
+    purchase orders. The move may depend on what the handler finds, as issuing stock
+    uses a batch up only when it takes the last of it. While the handler runs, any other
+    transition of a document the input refers to is an error in the module. Documents
+    the input does not refer to, such as one the command creates, are not held to it.
+    """
+    amends: ClassVar[str | None] = None
+    """The input field that refers to the document the command amends, if it amends one:
+    `amends = "item_id"` on a command that replaces an item's name and description.
+
+    Its other fields, but `version`, are the document's own, declared the same way, so
+    that a screen can edit them in place: it copies each value from the document into
+    the command, changes some, and sends them back with the version it read. The
+    handler may still work out other fields from them, as a line's amount from its
+    quantity.
+    """
 
 
 class Query[R](BaseModel):
@@ -65,6 +89,8 @@ class Change:
     """Where this sits in the audit trail."""
     at: datetime
     actor: str
+    actor_kind: ActorKind
+    """Whether a person, an agent or the system acted."""
     action: str
     """The command or subscription that ran."""
     documents: tuple[tuple[str, UUID, int], ...]

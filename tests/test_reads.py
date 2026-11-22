@@ -6,9 +6,11 @@ listing can compare.
 
 import base64
 import json
+from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from functools import partial
 from typing import Any
 from uuid import UUID, uuid7
 
@@ -30,6 +32,7 @@ from remit.kernel import (
     Lifecycle,
     MemoryStore,
     Module,
+    Money,
     Name,
     NotFound,
     Page,
@@ -76,6 +79,7 @@ class Sample(Document):
     urgent: bool = False
     logged_at: datetime | None = None
     """Written without a time zone, so it can be matched but not ordered."""
+    price: Money | None = None
 
 
 @lab.document
@@ -99,13 +103,14 @@ class Receive(Command[Sample]):
     taken_at: AwareDatetime | None = None
     urgent: bool = False
     logged_at: datetime | None = None
+    price: Money | None = None
 
 
 class Discard(Command[Sample]):
     sample_id: UUID
 
 
-class ReceiveAndReport(Command[tuple[tuple[str, ...], str | None, int]]):
+class ReceiveAndReport(Command[tuple[tuple[str, ...], str | None, int, tuple[int, int]]]):
     code: Code
     name: Name
     weight: Decimal
@@ -163,13 +168,19 @@ def who_is_asking(query: WhoIsAsking, reader: Reader) -> tuple[str, str]:
 @lab.command
 def receive_and_report(
     command: ReceiveAndReport, context: Context
-) -> tuple[tuple[str, ...], str | None, int]:
+) -> tuple[tuple[str, ...], str | None, int, tuple[int, int]]:
     """Receive one sample and discard another, then read what the laboratory now holds."""
     context.create(Sample(code=command.code, name=command.name, received=date(2026, 3, 1)))
     context.transition(context.get(Sample, command.discard), "discard")
     held = context.page(Sample, where={"state": "received"}, order="code", limit=3)
     heaviest = context.ask(Heaviest())
-    return tuple(s.code for s in held.items), heaviest and heaviest.code, context.ask(Tally())
+    totals = held.total, context.page(Sample, limit=1).total
+    return (
+        tuple(s.code for s in held.items),
+        heaviest and heaviest.code,
+        context.ask(Tally()),
+        totals,
+    )
 
 
 TECHNICIAN = Actor(id="tess", kind=ActorKind.HUMAN, permissions=frozenset({"lab.*"}))
@@ -189,6 +200,7 @@ SAMPLES: tuple[dict[str, Any], ...] = (
         "count": 3,
         "taken_at": "2026-01-05T09:00:00+01:00",
         "logged_at": "2026-01-05T09:00:00",
+        "price": {"currency": "GBP", "amount": "10.00"},
     },
     {
         "code": "S-002",
@@ -199,6 +211,7 @@ SAMPLES: tuple[dict[str, Any], ...] = (
         "count": 12,
         "taken_at": "2026-01-05T08:00:00Z",
         "urgent": True,
+        "price": {"currency": "GBP", "amount": "9.5"},
     },
     {"code": "S-003", "name": "100% Cotton", "received": "2026-02-01"},
     {
@@ -209,6 +222,7 @@ SAMPLES: tuple[dict[str, Any], ...] = (
         "weight": "10.5",
         "count": 7,
         "taken_at": "2026-02-02T00:00:00Z",
+        "price": {"currency": "GBP", "amount": "10"},
     },
     {
         "code": "S-010",
@@ -219,10 +233,23 @@ SAMPLES: tuple[dict[str, Any], ...] = (
         "weight": "100",
         "count": 1,
         "taken_at": "2026-02-01T23:59:59.5-01:00",
+        "price": {"currency": "USD", "amount": "50"},
     },
-    {"code": "S-10", "name": "S-001 retest", "received": "2026-01-05", "weight": "-0.25"},
+    {
+        "code": "S-10",
+        "name": "S-001 retest",
+        "received": "2026-01-05",
+        "weight": "-0.25",
+        "price": {"currency": "EUR", "amount": "10"},
+    },
     {"code": "ACME", "name": "acme", "notes": (r"Back\slash & Co",), "received": "2026-01-06"},
-    {"code": "Z9", "name": "Straße Nord", "received": "2026-01-07", "count": 12},
+    {
+        "code": "Z9",
+        "name": "Straße Nord",
+        "received": "2026-01-07",
+        "count": 12,
+        "price": {"currency": "JPY", "amount": "1200"},
+    },
 )
 
 
@@ -437,16 +464,195 @@ def test_documents_without_a_value_come_after_those_with_one(
     assert codes(kernel, order="taken_at", limit=1)[:4] == ["S-001", "S-002", "S-004", "S-010"]
 
 
+def test_a_listing_is_ordered_by_several_fields_each_in_its_own_direction(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    assert codes(kernel, order="grade,-weight") == [
+        *("S-004", "S-001"),
+        *("S-010", "S-002"),
+        *("Z9", "ACME", "S-003", "S-10"),
+    ], "documents that tie on every field are ordered by id, as the last field is"
+    assert codes(kernel, order="-received,code") == [
+        *("S-003", "S-004", "S-002", "Z9", "ACME"),
+        *("S-001", "S-10", "S-010"),
+    ]
+    assert codes(kernel, order="count,-id") == [
+        *("ACME", "S-10", "S-003", "S-010", "S-001", "S-004"),
+        *("Z9", "S-002"),
+    ], "or as id is, when it is named"
+
+
+def test_money_is_ordered_by_currency_then_by_amount(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    assert codes(kernel, order="price") == [
+        *("S-10",),
+        *("S-002", "S-001", "S-004"),
+        *("Z9",),
+        *("S-010",),
+        *("S-003", "ACME"),
+    ]
+    assert codes(kernel, order="-price", limit=3) == [
+        *("ACME", "S-003"),
+        *("S-010",),
+        *("Z9",),
+        *("S-004", "S-001", "S-002"),
+        *("S-10",),
+    ]
+    pounds = {"price": {"gte": {"currency": "GBP", "amount": "0"}}}
+    assert codes(kernel, where=pounds, order="-price") == ["S-004", "S-001", "S-002"], (
+        "in one currency, by amount"
+    )
+
+
+def test_money_is_filtered_by_money_and_compared_within_its_currency(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    ten_pounds = {"currency": "GBP", "amount": "10"}
+    assert codes(kernel, where={"price": ten_pounds}) == ["S-001", "S-004"]
+    assert codes(kernel, where={"price": Money.of("9.50", "GBP")}) == ["S-002"]
+    assert codes(kernel, where={"price": {"ne": ten_pounds}}) == [
+        *("S-002", "S-003", "S-010", "S-10", "ACME", "Z9"),
+    ], "everything else: other amounts, other currencies, and no price at all"
+    either = [{"currency": "EUR", "amount": "10.00"}, {"currency": "JPY", "amount": 1200}]
+    assert codes(kernel, where={"price": {"in": either}}) == ["S-10", "Z9"]
+
+    assert codes(kernel, where={"price": {"gt": {"currency": "GBP", "amount": "9.50"}}}) == [
+        "S-001",
+        "S-004",
+    ], "not the ten euros, fifty dollars or twelve hundred yen"
+    assert codes(kernel, where={"price": {"lte": {"currency": "USD", "amount": "50"}}}) == ["S-010"]
+    assert codes(kernel, where={"price": {"lt": {"currency": "CHF", "amount": "1000"}}}) == []
+
+
+def test_a_money_filter_must_be_given_money(kernel: Kernel) -> None:
+    with pytest.raises(Rejected, match=r"cannot list lab\.sample: ") as refusal:
+        kernel.page(
+            Sample,
+            actor=ROOT,
+            where={
+                "price": {
+                    "gt": "10",
+                    "lt": {"currency": "GBP", "amount": 10.5},
+                    "eq": {"currency": "GBP", "amount": "10.001"},
+                    "ne": {"currency": "XXY", "amount": "1"},
+                }
+            },
+        )
+
+    assert {(p.path, p.message) for p in refusal.value.problems} == {
+        (("where", "price", "gt"), "Input should be a valid dictionary or instance of Money"),
+        (
+            ("where", "price", "lt"),
+            "give amounts as strings, integers or Decimals; floats are inexact",
+        ),
+        (("where", "price", "eq"), "GBP amounts have at most 2 decimal places"),
+        (
+            ("where", "price", "ne"),
+            "'XXY' is not an ISO 4217 currency in current use with a minor unit "
+            "(for example GBP, EUR, USD, JPY)",
+        ),
+    }
+
+
+def held(sample: Sample, field: str) -> tuple[bool, Any]:
+    """What a sample holds in a field, after every value if it holds none: money by its
+    currency, then its amount."""
+    value = getattr(sample, field)
+    if isinstance(value, Money):
+        return False, (value.currency, value.amount)
+    return value is None, value
+
+
+def sorted_by(samples: Iterable[Sample], order: str) -> list[str]:
+    """The codes of the samples in the order `order` names, sorted here rather than by the
+    kernel: by id, then by each field from the least significant, each sort keeping the
+    order of those that tie, and each descending one reversed, nulls and all."""
+    named = [(field.removeprefix("-"), field.startswith("-")) for field in order.split(",")]
+    newest_first = named[-1][1]
+    if named[-1][0] == "id":
+        named.pop()
+    found = sorted(samples, key=lambda sample: sample.id, reverse=newest_first)
+    for field, descending in reversed(named):
+        found.sort(key=partial(held, field=field), reverse=descending)
+    return [sample.code for sample in found]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        "grade,weight",
+        "-grade,weight",
+        "grade,-weight",
+        "-grade,-weight,code",
+        "-taken_at,grade",
+        "taken_at,-grade",
+        "count,-taken_at,code",
+        "-count,grade,-weight",
+        "state,-received,id",
+        "-weight,-id",
+        "price,code",
+        "-price,grade",
+        "grade,-price,-id",
+    ],
+)
+def test_paging_through_several_fields_gives_the_whole_listing_in_order(
+    kernel: Kernel, stocked: dict[str, Sample], order: str
+) -> None:
+    twin = Receive(
+        code="S-005",
+        name="The same as S-004, written differently",
+        grade=Grade.A,
+        received=date(2026, 2, 1),
+        weight=Decimal("10.50"),
+        count=7,
+        taken_at=datetime.fromisoformat("2026-02-02T01:00:00+01:00"),
+        price=Money.of(10, "GBP"),
+    )
+    kernel.execute(twin, actor=TECHNICIAN)
+    kernel.execute(Discard(sample_id=stocked["S-003"].id), actor=TECHNICIAN)
+    everything = kernel.page(Sample, actor=ROOT, limit=len(SAMPLES) + 1).items
+
+    for limit in (1, 2, 3):
+        assert codes(kernel, order=order, limit=limit) == sorted_by(everything, order)
+
+
 def test_a_page_says_whether_another_follows(kernel: Kernel, stocked: dict[str, Sample]) -> None:
     first = kernel.page(Sample, actor=ROOT, order="code", limit=5)
     assert [s.code for s in first.items] == ["ACME", "S-001", "S-002", "S-003", "S-004"]
     assert first.next is not None
 
     last = kernel.page(Sample, actor=ROOT, order="code", limit=5, after=first.next)
-    assert last == Page((stocked["S-010"], stocked["S-10"], stocked["Z9"]), None)
+    assert last == Page((stocked["S-010"], stocked["S-10"], stocked["Z9"]), None, len(SAMPLES))
 
     exactly = kernel.page(Sample, actor=ROOT, limit=len(SAMPLES))
     assert exactly.next is None, "a full page with nothing after it is the last"
+
+
+def test_every_page_says_how_many_documents_the_listing_holds(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    kernel.execute(Discard(sample_id=stocked["S-003"].id), actor=TECHNICIAN)
+
+    def totals(**listing: Any) -> list[int]:
+        """The total each page of a listing gives, read two at a time."""
+        found: list[int] = []
+        after = None
+        for _ in range(len(SAMPLES)):
+            page = kernel.page(Sample, actor=OBSERVER, after=after, limit=2, **listing)
+            found.append(page.total)
+            after = page.next
+            if after is None:
+                return found
+        raise AssertionError("the listing never came to an end")
+
+    assert totals() == [len(SAMPLES)] * 4
+    assert totals(where={"state": "received"}, order="-weight") == [7] * 4
+    assert totals(where={"grade": "a"}) == [2]
+    assert totals(search="cotton", where={"state": "received"}) == [1]
+    assert totals(search="muller", order="code,-grade") == [2]
+    assert totals(where={"weight": {"gte": 10}}, search="s-0") == [3, 3]
+    assert totals(where={"grade": {"in": []}}) == [0]
 
 
 def test_documents_added_between_pages_are_neither_skipped_nor_repeated(kernel: Kernel) -> None:
@@ -474,6 +680,7 @@ def test_a_cursor_continues_only_the_listing_that_gave_it(
     others: list[dict[str, Any]] = [
         {"order": "name"},
         {"order": "-code"},
+        {"order": "code,grade"},
         {"order": "code", "where": {"grade": "a"}},
         {"order": "code", "search": "cotton"},
     ]
@@ -481,32 +688,58 @@ def test_a_cursor_continues_only_the_listing_that_gave_it(
         with pytest.raises(Rejected, match="is not a cursor from this listing") as refusal:
             kernel.page(Sample, actor=ROOT, after=cursor, **listing)
         assert [problem.path for problem in refusal.value.problems] == [("after",)]
+    place = forged(digest, ["S-001"], str(uuid7()))
+    resumed = kernel.page(Sample, actor=ROOT, order="code", limit=1, after=place).items
+    assert [sample.code for sample in resumed] == ["S-002"], "a place that makes sense is used"
     for nonsense in (
         "nonsense",
         "",
-        forged(digest, "S-001"),
-        forged(digest, 7, str(uuid7())),
-        forged(digest, True, str(uuid7())),
-        forged(digest, "S-001", "not an id"),
-        forged(digest, "S-001", 7),
+        forged(digest, ["S-001"]),
+        forged(digest, "S-001", str(uuid7())),
+        forged(digest, [], str(uuid7())),
+        forged(digest, ["S-001", "S-002"], str(uuid7())),
+        forged(digest, [7], str(uuid7())),
+        forged(digest, [True], str(uuid7())),
+        forged(digest, ["S-001"], "not an id"),
+        forged(digest, ["S-001"], 7),
     ):
         with pytest.raises(Rejected, match="is not a cursor from this listing"):
             kernel.page(Sample, actor=ROOT, order="code", after=nonsense)
 
-    weights = kernel.page(Sample, actor=ROOT, order="weight", limit=1).next
+    weights = kernel.page(Sample, actor=ROOT, order="-weight,received", limit=1).next
     assert weights is not None
     digest = json.loads(base64.urlsafe_b64decode(weights + "=" * (-len(weights) % 4)))[0]
     for weight in ("heavy", "NaN", "Infinity"):
         with pytest.raises(Rejected, match="is not a cursor from this listing"):
             kernel.page(
-                Sample, actor=ROOT, order="weight", after=forged(digest, weight, str(uuid7()))
+                Sample,
+                actor=ROOT,
+                order="-weight,received",
+                after=forged(digest, [weight, "2026-01-01"], str(uuid7())),
+            )
+
+    prices = kernel.page(Sample, actor=ROOT, order="price", limit=1).next
+    assert prices is not None
+    digest = json.loads(base64.urlsafe_b64decode(prices + "=" * (-len(prices) % 4)))[0]
+    resumed = kernel.page(
+        Sample,
+        actor=ROOT,
+        order="price",
+        limit=1,
+        after=forged(digest, [{"currency": "GBP", "amount": "9.5"}], str(uuid7())),
+    ).items
+    assert [sample.code for sample in resumed] == ["S-001"]
+    for price in ("10", {"currency": "GBP"}, {"currency": "GBP", "amount": "NaN"}, [1]):
+        with pytest.raises(Rejected, match="is not a cursor from this listing"):
+            kernel.page(
+                Sample, actor=ROOT, order="price", after=forged(digest, [price], str(uuid7()))
             )
 
     oldest_first = kernel.page(Sample, actor=ROOT, limit=1).next
     assert oldest_first is not None
     digest = json.loads(base64.urlsafe_b64decode(oldest_first + "=" * (-len(oldest_first) % 4)))[0]
     with pytest.raises(Rejected, match="is not a cursor from this listing"):
-        kernel.page(Sample, actor=ROOT, after=forged(digest, "S-001", str(uuid7())))
+        kernel.page(Sample, actor=ROOT, after=forged(digest, ["S-001"], str(uuid7())))
 
 
 def test_a_listing_that_cannot_mean_anything_is_refused_with_every_fault(
@@ -552,12 +785,28 @@ def test_a_listing_that_cannot_mean_anything_is_refused_with_every_fault(
         Problem(
             ("order",),
             "cannot order by 'urgent'; it can be ordered by id, state, version, code, name, "
-            "grade, received, weight, count, taken_at",
+            "grade, received, weight, count, taken_at, price",
         ),
         Problem(("limit",), "must be between 1 and 200"),
     }
     with pytest.raises(Rejected, match="limit: must be between 1 and 200"):
         kernel.page(Sample, actor=ROOT, limit=0)
+
+
+def test_an_order_names_each_field_once_and_nothing_after_id(kernel: Kernel) -> None:
+    orders = (
+        "it can be ordered by id, state, version, code, name, grade, received, weight, "
+        "count, taken_at, price"
+    )
+    with pytest.raises(Rejected, match=r"cannot list lab\.sample: order: ") as refusal:
+        kernel.page(Sample, actor=ROOT, order="code,urgent,,-code,-id,name")
+
+    assert refusal.value.problems == (
+        Problem(("order",), f"cannot order by 'urgent'; {orders}"),
+        Problem(("order",), f"cannot order by ''; {orders}"),
+        Problem(("order",), "names 'code' twice"),
+        Problem(("order",), "cannot order by 'name' after id, which no two documents share"),
+    )
 
 
 # Search.
@@ -657,6 +906,120 @@ def test_folding_removes_case_accents_and_width() -> None:
     assert fold("  \uff2düller\tSTRAẞE  Ångström ") == "muller strasse angstrom"
 
 
+# Counting the values a field holds.
+
+
+def counted(kernel: Kernel, field: str, **listing: Any) -> list[tuple[Any, int]]:
+    found = kernel.values(Sample, field, actor=OBSERVER, **listing)
+    return [(each.value, each.count) for each in found.items]
+
+
+def test_each_value_a_field_holds_is_counted_null_first_then_lowest_first(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    kernel.execute(Discard(sample_id=stocked["S-003"].id), actor=TECHNICIAN)
+
+    assert counted(kernel, "grade") == [(None, 4), ("a", 2), ("b", 2)]
+    assert counted(kernel, "state") == [("discarded", 1), ("received", 7)]
+    assert counted(kernel, "count") == [(0, 3), (1, 1), (3, 1), (7, 1), (12, 2)]
+    assert counted(kernel, "urgent") == [(False, 7), (True, 1)]
+    assert counted(kernel, "logged_at") == [(None, 7), ("2026-01-05T09:00:00", 1)]
+    assert counted(kernel, "received") == [
+        ("2025-12-31", 1),
+        ("2026-01-05", 2),
+        ("2026-01-06", 1),
+        ("2026-01-07", 1),
+        ("2026-01-20", 1),
+        ("2026-02-01", 2),
+    ]
+    assert counted(kernel, "id", where={"code": {"in": ["ACME", "Z9"]}}) == sorted(
+        (str(stocked[code].id), 1) for code in ("ACME", "Z9")
+    )
+
+
+def test_values_a_filter_finds_equal_are_counted_as_one(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    assert counted(kernel, "weight") == [
+        (None, 3),
+        ("-0.25", 1),
+        ("9", 1),
+        ("10.5", 2),
+        ("100", 1),
+    ], "10.50 and 10.5 are one value, given as the first written in code point order"
+    assert len(codes(kernel, where={"weight": "10.5"})) == 2
+
+    taken = [stocked[code].model_dump(mode="json")["taken_at"] for code in ("S-004", "S-010")]
+    assert counted(kernel, "taken_at") == [
+        (None, 4),
+        ("2026-01-05T08:00:00Z", 2),
+        (taken[0], 1),
+        (taken[1], 1),
+    ], "S-001 and S-002 were taken at one instant, written in different time zones"
+
+
+def test_money_is_counted_as_money(kernel: Kernel, stocked: dict[str, Sample]) -> None:
+    assert counted(kernel, "price") == [
+        (None, 2),
+        ({"currency": "EUR", "amount": "10.00"}, 1),
+        ({"currency": "GBP", "amount": "9.50"}, 1),
+        ({"currency": "GBP", "amount": "10.00"}, 2),
+        ({"currency": "JPY", "amount": "1200"}, 1),
+        ({"currency": "USD", "amount": "50.00"}, 1),
+    ]
+
+
+def test_values_are_counted_across_the_listing_where_and_search_select(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    assert counted(kernel, "grade", where={"weight": {"gte": 10}}) == [("a", 2), ("b", 1)]
+    assert counted(kernel, "grade", search="cotton") == [(None, 1), ("a", 1)]
+    assert counted(kernel, "count", where={"grade": None}, search="o") == [(0, 2), (12, 1)]
+    assert counted(kernel, "count", where={"grade": {"in": []}}) == []
+
+
+def test_values_beyond_the_limit_are_said_to_be_left_out(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    first = kernel.values(Sample, "count", actor=OBSERVER, limit=2)
+    assert [(each.value, each.count) for each in first.items] == [(0, 3), (1, 1)]
+    assert first.more is True
+    assert kernel.values(Sample, "count", actor=OBSERVER, limit=5).more is False
+    assert kernel.values(Sample, "count", actor=OBSERVER).more is False
+
+
+def test_counting_values_takes_the_permission_to_read(
+    kernel: Kernel, stocked: dict[str, Sample]
+) -> None:
+    with pytest.raises(Unauthorised, match=r"cal does not hold the permission lab\.read\.sample"):
+        kernel.values(Sample, "grade", actor=COURIER)
+    with pytest.raises(Unauthorised):
+        kernel.values(Sample, "no such field", actor=COUNTER)
+
+
+def test_only_the_values_of_a_field_a_listing_can_filter_on_are_counted(kernel: Kernel) -> None:
+    countable = (
+        "the values of id, state, version, code, name, grade, received, weight, count, "
+        "taken_at, urgent, logged_at, price can be counted"
+    )
+    with pytest.raises(Rejected, match=r"cannot count the values in lab\.sample: ") as refusal:
+        kernel.values(Sample, "notes", actor=ROOT, where={"colour": "red"}, limit=501)
+    multiple = "holds more than one value, so it cannot be filtered on"
+    assert refusal.value.problems == (
+        Problem(("field",), f"'notes' {multiple}; {countable}"),
+        Problem(("where", "colour"), "it has no such field"),
+        Problem(("limit",), "must be between 1 and 500"),
+    )
+
+    with pytest.raises(Rejected) as refusal:
+        kernel.values(Sample, "colour", actor=ROOT, search="x" * 201, limit=0)
+    assert refusal.value.problems == (
+        Problem(("field",), f"'colour' is not a field; {countable}"),
+        Problem(("search",), "is longer than 200 characters"),
+        Problem(("limit",), "must be between 1 and 500"),
+    )
+
+
 # Reads inside a unit of work.
 
 
@@ -667,11 +1030,12 @@ def test_a_handler_reads_what_its_unit_of_work_has_written(
         code="A-1", name="New arrival", weight=Decimal(1), discard=stocked["S-010"].id
     )
 
-    listed, heaviest, held = kernel.execute(command, actor=TECHNICIAN).result
+    listed, heaviest, held, totals = kernel.execute(command, actor=TECHNICIAN).result
 
     assert listed == ("A-1", "ACME", "S-001"), "the sample it received is on the page"
     assert heaviest == "S-004", "the one it discarded is no longer the heaviest held"
     assert held == len(SAMPLES), "one received and one discarded"
+    assert totals == (len(SAMPLES), len(SAMPLES) + 1), "pages count what the unit wrote"
 
 
 def test_a_dry_run_reads_its_own_writes_and_leaves_none(
@@ -681,7 +1045,7 @@ def test_a_dry_run_reads_its_own_writes_and_leaves_none(
         code="A-1", name="New arrival", weight=Decimal(1), discard=stocked["S-001"].id
     )
 
-    listed, _, _ = kernel.execute(command, actor=TECHNICIAN, dry_run=True).result
+    listed, _, _, _ = kernel.execute(command, actor=TECHNICIAN, dry_run=True).result
 
     assert listed == ("A-1", "ACME", "S-002")
     assert codes(kernel, order="code")[:3] == ["ACME", "S-001", "S-002"]
@@ -825,6 +1189,8 @@ def test_the_registry_describes_how_everything_is_read(kernel: Kernel) -> None:
     assert sample["listing"]["searchable"] == ["code", "name", "notes"]
     assert sample["listing"]["limit"] == {"default": 50, "maximum": 200}
     assert sample["listing"]["filters"]["weight"] == ["eq", "ne", "in", "gt", "gte", "lt", "lte"]
+    assert sample["listing"]["filters"]["price"] == ["eq", "ne", "in", "gt", "gte", "lt", "lte"]
+    assert "price" in sample["listing"]["orders"]
     assert sample["listing"]["filters"]["urgent"] == ["eq", "ne", "in"]
     assert sample["listing"]["filters"]["logged_at"] == ["eq", "ne", "in"]
     assert "notes" not in sample["listing"]["filters"]
@@ -864,6 +1230,7 @@ def listings(values: dict[str, list[Any]]) -> st.SearchStrategy[dict[str, Any]]:
         )
 
     orders = [name for name, column in found.items() if column.comparison]
+    named = st.sampled_from([*orders, *(f"-{name}" for name in orders)])
     searches = ["muller", "S-001", "cotton", "100%", "_", "o", "é", "keep cold", "zzz", "\\", "s"]
     return st.fixed_dictionaries(
         {"limit": st.integers(1, 5)},
@@ -871,13 +1238,17 @@ def listings(values: dict[str, list[Any]]) -> st.SearchStrategy[dict[str, Any]]:
             "where": st.dictionaries(st.sampled_from(sorted(found)), st.none(), max_size=3).flatmap(
                 lambda chosen: st.fixed_dictionaries({field: condition(field) for field in chosen})
             ),
-            "order": st.sampled_from([*orders, *(f"-{name}" for name in orders)]),
+            "order": st.lists(
+                named, min_size=1, max_size=3, unique_by=lambda order: order.removeprefix("-")
+            ).map(",".join),
             "search": st.sampled_from(searches),
         },
     )
 
 
-def test_both_stores_give_the_same_pages_for_any_listing(postgres: PostgresStore) -> None:
+def stocked_twice(postgres: PostgresStore) -> tuple[Kernel, Kernel, dict[str, list[Any]]]:
+    """The same samples in memory and on PostgreSQL, one of them discarded, and the values
+    each field can be filtered on."""
     memory, database = kernel_on(MemoryStore(), [lab]), kernel_on(postgres, [lab])
     stocked = stock(memory)
     stock(database)
@@ -890,6 +1261,11 @@ def test_both_stores_give_the_same_pages_for_any_listing(postgres: PostgresStore
     }
     values["id"] = [uuid7()]
     values["state"] = ["received", "discarded"]
+    return memory, database, values
+
+
+def test_both_stores_give_the_same_pages_for_any_listing(postgres: PostgresStore) -> None:
+    memory, database, values = stocked_twice(postgres)
 
     @settings(max_examples=400, deadline=None)
     @given(listings(values))
@@ -901,6 +1277,28 @@ def test_both_stores_give_the_same_pages_for_any_listing(postgres: PostgresStore
                 codes(database, **listing)
         else:
             assert codes(database, **listing) == expected
+            for kernel in (memory, database):
+                assert kernel.page(Sample, actor=ROOT, **listing).total == len(expected)
+
+    agree()
+
+
+def test_both_stores_count_the_same_values_for_any_listing(postgres: PostgresStore) -> None:
+    memory, database, values = stocked_twice(postgres)
+    # Each store gave its samples their own ids, so ids are the one field they cannot share.
+    fields = [field for field in columns(Sample) if field != "id"]
+
+    @settings(max_examples=200, deadline=None)
+    @given(listings(values), st.sampled_from([*fields, "notes"]))
+    def agree(listing: dict[str, Any], field: str) -> None:
+        asked = {part: given for part, given in listing.items() if part != "order"}
+        try:
+            expected = memory.values(Sample, field, actor=ROOT, **asked)
+        except Rejected as refusal:
+            with pytest.raises(Rejected, match=str(refusal).split(":")[0]):
+                database.values(Sample, field, actor=ROOT, **asked)
+        else:
+            assert database.values(Sample, field, actor=ROOT, **asked) == expected
 
     agree()
 

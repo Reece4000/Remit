@@ -1,7 +1,8 @@
 """The items module's documents and events.
 
 An item records what something is. How it is priced, taxed, stocked, bought or made
-belongs to the modules concerned, which refer to the item by id.
+belongs to the modules concerned, which refer to the item by id, or add fields of their
+own to it as extensions.
 """
 
 from enum import StrEnum

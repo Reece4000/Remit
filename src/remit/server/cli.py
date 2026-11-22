@@ -23,14 +23,14 @@ import httpx2
 import uvicorn
 
 from remit import access
-from remit.kernel import Actor, ActorKind, Kernel, PostgresStore, Rejected
+from remit.kernel import Actor, Kernel, PostgresStore, Rejected
 
 from .app import create_app
 from .auth import Verifier
 from .settings import Settings
 from .worker import work
 
-SETUP = Actor(id="system:setup", kind=ActorKind.SYSTEM, permissions=frozenset({"*"}))
+SETUP = Actor.system("setup", permissions={"*"})
 """Who `enrol` acts as. Anyone who can run it can reach the database already."""
 
 OWNER = "OWNER"

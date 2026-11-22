@@ -1,8 +1,8 @@
 # Modules and templates
 
 Status: dependencies between modules are built, as are the first standard modules
-(parties, items, and access, through which people and agents sign in). Extensions, guards, links between lines and templates are designed
-here but not yet built.
+(parties, items, and access, through which people and agents sign in) and extensions.
+Guards, links between lines and templates are designed here but not yet built.
 
 ## The rule
 
@@ -43,10 +43,10 @@ A module declares documents, events, commands, queries and subscriptions (as now
   read a document or ask a query is `<module>.read.<name>`. A subscription can be given a
   fixed name, `@module.subscribe(Event, name="notify")`, so that its handler can be
   renamed freely.
-- **Extensions to other modules' documents.** A module can add fields to a document it
-  does not own. For example, a warranty module adds a warranty period to an item. The
-  owning module doesn't know about the extension, and the extension is namespaced so two
-  modules cannot collide.
+- **Extensions to other modules' documents.** A module can add fields to a document of
+  a module it requires. For example, a warranty module adds a warranty period to an
+  item. The owning module doesn't know about the extension; the registry refuses two
+  modules that would add the same field. See [extensions](extensions.md).
 - **Guards on other modules' transitions.** A module can refuse a transition it does
   not own, giving the reason in the same words as any other refusal. For example, an
   order cannot be released until a credit check has passed. This is how a custom

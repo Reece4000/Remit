@@ -65,6 +65,7 @@ class AmendParty(Command[Party]):
     the tax number.
     """
 
+    amends = "party_id"
     party_id: PartyId
     version: int
     """The version these details were read at. Refused if the party has changed since."""
@@ -73,14 +74,17 @@ class AmendParty(Command[Party]):
 
 
 class ArchiveParty(Command[Party]):
+    moves = "archive"
     party_id: PartyId
 
 
 class RestoreParty(Command[Party]):
+    moves = "restore"
     party_id: PartyId
 
 
 class EraseParty(Command[Party]):
+    moves = "erase"
     party_id: PartyId
 
 
@@ -95,6 +99,7 @@ class AddContact(Command[Contact]):
 class AmendContact(Command[Contact]):
     """Replace a contact's details. Every field is required; send null to clear one."""
 
+    amends = "contact_id"
     contact_id: ContactId
     version: int
     """The version these details were read at. Refused if the contact has changed since."""
@@ -105,10 +110,12 @@ class AmendContact(Command[Contact]):
 
 
 class RemoveContact(Command[Contact]):
+    moves = "remove"
     contact_id: ContactId
 
 
 class EraseContact(Command[Contact]):
+    moves = "erase"
     contact_id: ContactId
 
 
@@ -122,6 +129,7 @@ class AddAddress(Command[Address]):
 class AmendAddress(Command[Address]):
     """Replace an address. Every field is required."""
 
+    amends = "address_id"
     address_id: AddressId
     version: int
     """The version this address was read at. Refused if it has changed since."""
@@ -131,10 +139,12 @@ class AmendAddress(Command[Address]):
 
 
 class RemoveAddress(Command[Address]):
+    moves = "remove"
     address_id: AddressId
 
 
 class EraseAddress(Command[Address]):
+    moves = "erase"
     address_id: AddressId
 
 

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from remit import access, parties
 from remit.access import MemberKind
-from remit.kernel import ERASED, Actor, ActorKind, Kernel, Rejected, Store
+from remit.kernel import ERASED, MAX_LIMIT, Actor, ActorKind, Kernel, Rejected, Store
 
 ISSUER = "https://id.example.com/realms/remit"
 OWNER = Actor(id="system:setup", kind=ActorKind.SYSTEM, permissions=frozenset({"*"}))
@@ -244,3 +244,31 @@ def test_signing_in_reads_only_with_its_own_permission(kernel: Kernel) -> None:
     assert kernel.ask(access.SignIn(issuer=ISSUER, subject="ana"), actor=server) is not None
     with pytest.raises(Exception, match=r"does not hold the permission access\.read\.member"):
         kernel.get(access.Member, uuid7(), actor=server)
+
+
+def test_actors_are_named_as_members_are_called_until_erased(kernel: Kernel) -> None:
+    ana, ben = enrol(kernel, "ana"), enrol(kernel, "ben")
+    enrolled = access.EnrolMember(
+        name="Payables agent", kind=MemberKind.AGENT, issuer=ISSUER, subject="payables-bot"
+    )
+    agent = kernel.execute(enrolled, actor=OWNER).result
+    for member in (ana, ben):
+        kernel.execute(access.SuspendMember(member_id=member.id), actor=OWNER)
+    kernel.execute(access.EraseMember(member_id=ben.id), actor=OWNER)
+
+    server = Actor(
+        id="system:api", kind=ActorKind.SYSTEM, permissions=frozenset({"access.read.actor_names"})
+    )
+    actors = (str(ana.id), str(ben.id), str(agent.id), OWNER.id, str(uuid7()))
+    named = kernel.ask(access.ActorNames(actors=actors), actor=server)
+    assert named == {str(ana.id): "Ana", str(agent.id): "Payables agent"}
+    assert kernel.ask(access.ActorNames(actors=(OWNER.id,)), actor=server) == {}
+
+
+def test_as_many_actors_are_named_at_once_as_a_page_of_changes_holds(kernel: Kernel) -> None:
+    ana = enrol(kernel, "ana")
+    unknown = tuple(str(uuid7()) for _ in range(MAX_LIMIT - 1))
+    named = kernel.ask(access.ActorNames(actors=(*unknown, str(ana.id))), actor=ROOT)
+    assert named == {str(ana.id): "Ana"}
+    with pytest.raises(ValidationError, match="at most 200 items"):
+        access.ActorNames(actors=(*unknown, str(ana.id), str(uuid7())))

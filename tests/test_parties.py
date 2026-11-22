@@ -15,6 +15,7 @@ from remit.kernel import (
     Rejected,
     Store,
     Unauthorised,
+    said,
 )
 from remit.parties import (
     AddAddress,
@@ -230,8 +231,11 @@ def test_addresses_need_lines_and_an_assigned_country_code(
 
 
 def test_a_contact_needs_a_real_email_address() -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as raised:
         AddContact(party_id=uuid7(), name="Sanne", email="not an address")
+    [found] = raised.value.errors()
+    assert found["loc"] == ("email",)
+    assert said(found).startswith("value is not a valid email address: ")
 
 
 def test_erasing_a_contact_leaves_the_rest_of_the_party(kernel: Kernel) -> None:

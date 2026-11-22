@@ -4,13 +4,14 @@ Each is a pydantic model so that the OpenAPI document describes it exactly, and 
 generated from that document gets real types.
 """
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from remit.kernel import ActorKind, AuditEntry, Change, Changes, Recorded
+from remit.kernel import ActorKind, AuditEntry, Change, Changes, Money, Recorded, Values
 
 
 class _Sent(BaseModel):
@@ -47,6 +48,35 @@ class Listed[D](_Sent):
     items: list[D]
     next: str | None
     """Pass as `after` for the next page. Null on the last page."""
+    total: int
+    """How many documents the listing holds on every page together: all that `where` and
+    `search` find, whatever `after` and `limit` say."""
+
+
+class CountedSent(_Sent):
+    """A value a field holds, and how many documents hold it."""
+
+    value: str | int | float | bool | Money | None
+    """As the documents hold it: ids, dates, times and enumerations as text, decimal
+    amounts as the text they are written in, other numbers as numbers, and money as
+    money, with its currency and its amount."""
+    count: int
+    """How many documents of the listing hold it: as many as filtering on it finds."""
+
+
+class ValuesSent(_Sent):
+    """The values a field holds across a listing: null first, then lowest to highest."""
+
+    values: list[CountedSent]
+    more: bool
+    """True when there are values beyond these, which `limit` left out."""
+
+    @classmethod
+    def of(cls, values: Values) -> ValuesSent:
+        return cls(
+            values=[CountedSent(value=c.value, count=c.count) for c in values.items],
+            more=values.more,
+        )
 
 
 class ChangeSent(_Sent):
@@ -55,15 +85,24 @@ class ChangeSent(_Sent):
     position: int
     at: datetime
     actor: str
+    actor_name: str | None
+    """What the actor is called: a person or an agent as the access module knows them, and
+    the system in words, such as `Setup` for `system:setup`. None when the actor has no
+    name, as a member whose name has been erased has not."""
+    actor_kind: ActorKind
+    """Whether a person, an agent or the system acted."""
     action: str
     documents: list[Written]
 
     @classmethod
-    def of(cls, change: Change) -> ChangeSent:
+    def of(cls, change: Change, names: Mapping[str, str]) -> ChangeSent:
+        """`names` maps an actor's id to what they are called, for actors who have names."""
         return cls(
             position=change.position,
             at=change.at,
             actor=change.actor,
+            actor_name=names.get(change.actor),
+            actor_kind=change.actor_kind,
             action=change.action,
             documents=[Written(kind=k, id=i, version=v) for k, i, v in change.documents],
         )
@@ -76,8 +115,16 @@ class ChangesSent(_Sent):
     position: int
 
     @classmethod
-    def of(cls, changes: Changes) -> ChangesSent:
-        return cls(items=[ChangeSent.of(c) for c in changes.items], position=changes.position)
+    def of(cls, changes: Changes, names: Mapping[str, str]) -> ChangesSent:
+        items = [ChangeSent.of(c, names) for c in changes.items]
+        return cls(items=items, position=changes.position)
+
+
+class PositionSent(_Sent):
+    """Where the changes feed has got to."""
+
+    position: int
+    """Pass as `after`, or to the stream, to follow only what commits from now."""
 
 
 class ActorSent(_Sent):

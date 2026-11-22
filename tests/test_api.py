@@ -33,6 +33,7 @@ from remit.kernel import (
     Kernel,
     Lifecycle,
     Module,
+    Money,
     Name,
     Query,
     Reader,
@@ -107,11 +108,13 @@ class Ticket(Document):
 
     code: Code
     subject: Name
+    budget: Money | None = None
 
 
 class OpenTicket(Command[Ticket]):
     code: Code
     subject: Name
+    budget: Money | None = None
 
 
 class Waiting(Query[int]):
@@ -129,7 +132,7 @@ class Break(Command[None]):
 @desk.command
 def open_ticket(command: OpenTicket, context: Context) -> Ticket:
     """Open a ticket."""
-    return context.create(Ticket(code=command.code, subject=command.subject))
+    return context.create(Ticket.model_validate(command.model_dump()))
 
 
 @desk.command
@@ -440,6 +443,25 @@ def test_input_a_command_does_not_accept_is_refused_field_by_field(
     assert paths == {("code",), ("subject",), ("extra",)}
 
 
+def test_a_malformed_email_address_is_refused_on_its_field(
+    client: TestClient, kernel: Kernel, provider: IdentityProvider
+) -> None:
+    enrol(kernel, "contacts", "parties.*")
+    headers = {"Authorization": f"Bearer {provider.token('contacts')}"}
+    amending = {
+        "contact_id": str(uuid7()),
+        "version": 1,
+        "name": "Sanne",
+        "role": None,
+        "email": "not an address",
+        "phone": None,
+    }
+    response = client.post("/commands/parties.amend_contact", json=amending, headers=headers)
+    [refused] = problem(response, 422, "rejected")["problems"]
+    assert refused["path"] == ["email"]
+    assert refused["message"].startswith("value is not a valid email address: ")
+
+
 def test_a_command_the_rules_refuse_says_which_field_and_why(
     client: TestClient, clerk: dict[str, str]
 ) -> None:
@@ -523,10 +545,175 @@ def test_documents_are_listed_filtered_searched_and_paged(
     rest = listed(order="-code", limit=2, after=first["next"])
     assert [t["code"] for t in rest["items"]] == ["T-1"]
     assert rest["next"] is None
+    assert first["total"] == rest["total"] == 3
 
     chosen = listed(where=json.dumps({"code": {"in": ["T-1", "T-3"]}}), order="code")
     assert [t["code"] for t in chosen["items"]] == ["T-1", "T-3"]
-    assert [t["code"] for t in listed(search="about t-2")["items"]] == ["T-2"]
+    assert chosen["total"] == 2
+    searched = listed(search="about t-2")
+    assert ([t["code"] for t in searched["items"]], searched["total"]) == (["T-2"], 1)
+
+
+def open_tickets_about(
+    client: TestClient, headers: dict[str, str], subjects: dict[str, str]
+) -> None:
+    """Open a ticket for each code given, about the subject given with it."""
+    for code, subject in subjects.items():
+        sent = {"code": code, "subject": subject}
+        response = client.post("/commands/desk.open_ticket", json=sent, headers=headers)
+        assert response.status_code == 200, response.text
+
+
+def test_documents_are_listed_in_the_order_of_several_fields(
+    client: TestClient, clerk: dict[str, str]
+) -> None:
+    open_tickets_about(client, clerk, {"T-1": "Printer", "T-2": "Printer", "T-3": "Login"})
+
+    def ordered(order: str, limit: int) -> list[str]:
+        found: list[str] = []
+        parameters: dict[str, Any] = {"order": order, "limit": limit}
+        while True:
+            response = client.get("/documents/desk.ticket", params=parameters, headers=clerk)
+            assert response.status_code == 200, response.text
+            found += [t["code"] for t in response.json()["items"]]
+            if response.json()["next"] is None:
+                return found
+            parameters["after"] = response.json()["next"]
+
+    assert ordered("subject,-code", 1) == ["T-3", "T-2", "T-1"]
+    assert ordered("-subject,code", 2) == ["T-1", "T-2", "T-3"]
+    body = problem(
+        client.get("/documents/desk.ticket", params={"order": "code,code"}, headers=clerk),
+        422,
+        "rejected",
+    )
+    assert body["problems"] == [{"path": ["order"], "message": "names 'code' twice"}]
+
+
+def test_the_values_of_a_field_are_counted_across_a_listing(
+    client: TestClient, clerk: dict[str, str]
+) -> None:
+    subjects = {"T-1": "Printer", "T-2": "Printer", "T-3": "Login", "T-4": "Printer"}
+    open_tickets_about(client, clerk, subjects)
+
+    def values(field: str, **parameters: Any) -> dict[str, Any]:
+        response = client.get(
+            f"/documents/desk.ticket/values/{field}", params=parameters, headers=clerk
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert values("subject") == {
+        "values": [{"value": "Login", "count": 1}, {"value": "Printer", "count": 3}],
+        "more": False,
+    }
+    assert values("subject", limit=1) == {"values": [{"value": "Login", "count": 1}], "more": True}
+    assert values("code", where=json.dumps({"code": {"ne": "T-1"}}), search="printer") == {
+        "values": [{"value": "T-2", "count": 1}, {"value": "T-4", "count": 1}],
+        "more": False,
+    }
+    assert values("version")["values"] == [{"value": 1, "count": 4}], "a number as a number"
+
+
+def test_money_is_ordered_filtered_and_counted_as_money(
+    client: TestClient, clerk: dict[str, str]
+) -> None:
+    budgets = {
+        "T-1": {"currency": "GBP", "amount": "250"},
+        "T-2": {"currency": "EUR", "amount": "90.5"},
+        "T-3": {"currency": "GBP", "amount": "75"},
+        "T-4": None,
+    }
+    for code, budget in budgets.items():
+        sent = {"code": code, "subject": "Training", "budget": budget}
+        assert client.post("/commands/desk.open_ticket", json=sent, headers=clerk).is_success
+
+    def listed(**parameters: Any) -> list[str]:
+        response = client.get("/documents/desk.ticket", params=parameters, headers=clerk)
+        assert response.status_code == 200, response.text
+        return [ticket["code"] for ticket in response.json()["items"]]
+
+    assert listed(order="budget") == ["T-2", "T-3", "T-1", "T-4"]
+    assert listed(order="-budget") == ["T-4", "T-1", "T-3", "T-2"]
+    over = {"budget": {"gt": {"currency": "GBP", "amount": "80"}}}
+    assert listed(where=json.dumps(over)) == ["T-1"], "not the euros"
+    exactly = {"budget": {"currency": "EUR", "amount": "90.50"}}
+    assert listed(where=json.dumps(exactly)) == ["T-2"]
+
+    counted = client.get("/documents/desk.ticket/values/budget", headers=clerk).json()
+    assert counted["values"] == [
+        {"value": None, "count": 1},
+        {"value": {"currency": "EUR", "amount": "90.50"}, "count": 1},
+        {"value": {"currency": "GBP", "amount": "75.00"}, "count": 1},
+        {"value": {"currency": "GBP", "amount": "250.00"}, "count": 1},
+    ]
+
+
+def test_values_are_given_as_documents_hold_them(
+    client: TestClient, kernel: Kernel, clerk: dict[str, str]
+) -> None:
+    def register(code: str, kind: parties.PartyKind) -> parties.Party:
+        command = parties.RegisterParty(code=code, kind=kind, name=f"Party {code}")
+        return kernel.execute(command, actor=OWNER).result
+
+    acme = register("C1", parties.PartyKind.ORGANISATION)
+    register("C2", parties.PartyKind.ORGANISATION)
+    shaw = register("C3", parties.PartyKind.PERSON)
+    for party, name in ((acme, "Ann"), (acme, "Bob"), (shaw, "Cy")):
+        kernel.execute(parties.AddContact(party_id=party.id, name=name), actor=OWNER)
+
+    def values(kind: str, field: str) -> list[dict[str, Any]]:
+        response = client.get(f"/documents/{kind}/values/{field}", headers=clerk)
+        assert response.status_code == 200, response.text
+        return response.json()["values"]
+
+    assert values("parties.party", "kind") == [
+        {"value": "organisation", "count": 2},
+        {"value": "person", "count": 1},
+    ], "an enumeration as its values"
+    assert values("parties.contact", "party_id") == sorted(
+        [{"value": str(acme.id), "count": 2}, {"value": str(shaw.id), "count": 1}],
+        key=lambda counted: counted["value"],
+    ), "a reference as the id it refers to"
+
+
+def test_counting_values_that_cannot_be_counted_says_why(
+    client: TestClient, kernel: Kernel, provider: IdentityProvider, clerk: dict[str, str]
+) -> None:
+    body = problem(
+        client.get(
+            "/documents/desk.ticket/values/colour",
+            params={"where": json.dumps({"nothing": 1}), "limit": 5},
+            headers=clerk,
+        ),
+        422,
+        "rejected",
+    )
+    assert body["detail"].startswith("cannot count the values in desk.ticket: field: ")
+    assert body["problems"] == [
+        {
+            "path": ["field"],
+            "message": "'colour' is not a field; the values of id, state, version, code, "
+            "subject, budget can be counted",
+        },
+        {"path": ["where", "nothing"], "message": "it has no such field"},
+    ]
+    body = problem(
+        client.get("/documents/desk.ticket/values/code", params={"limit": 501}, headers=clerk),
+        422,
+        "rejected",
+    )
+    assert body["problems"][0]["path"] == ["query", "limit"]
+    body = problem(
+        client.get("/documents/desk.ticket/values/code", params={"where": "[]"}, headers=clerk),
+        422,
+        "rejected",
+    )
+    assert body["problems"] == [{"path": ["where"], "message": "must be a JSON object"}]
+
+    enrol(kernel, "outsider", "parties.read.*")
+    headers = {"Authorization": f"Bearer {provider.token('outsider')}"}
+    problem(client.get("/documents/desk.ticket/values/code", headers=headers), 403, "unauthorised")
 
 
 def test_a_listing_that_cannot_be_run_says_why(client: TestClient, clerk: dict[str, str]) -> None:
@@ -604,6 +791,84 @@ def test_the_changes_feed_shows_only_what_the_member_may_read(
     limited = client.get("/changes", headers=headers).json()
     assert {d["kind"] for c in limited["items"] for d in c["documents"]} == {"desk.ticket"}
     assert limited["position"] == seen["position"] + 2  # the enrolment wrote a role and a member
+    by = {(c["action"], c["actor_kind"]) for c in seen["items"]}
+    assert by >= {("desk.open_ticket", "human"), ("parties.register_party", "system")}
+
+
+def test_each_change_names_who_made_it(
+    client: TestClient, kernel: Kernel, clerk: dict[str, str]
+) -> None:
+    ticket = open_ticket_now(client, clerk, "T-1")["result"]
+    enrolled = access.EnrolMember(
+        name="Desk agent", kind=access.MemberKind.AGENT, issuer=ISSUER, subject="desk-agent"
+    )
+    agent = kernel.execute(enrolled, actor=OWNER).result
+    as_agent = Actor(id=str(agent.id), kind=ActorKind.AGENT, permissions=frozenset({"desk.*"}))
+    kernel.execute(OpenTicket(code="T-2", subject="Opened by an agent"), actor=as_agent)
+    kernel.execute(OpenTicket(code="T-3", subject="Opened by the system"), actor=OWNER)
+    unnamed = Actor(id="cron", kind=ActorKind.SYSTEM, permissions=frozenset({"desk.*"}))
+    kernel.execute(OpenTicket(code="T-4", subject="Opened by a scheduler"), actor=unnamed)
+
+    seen = client.get("/changes", headers=clerk).json()["items"]
+    assert [(c["actor_name"], c["actor_kind"]) for c in seen] == [
+        ("Clerk", "human"),
+        ("Desk agent", "agent"),
+        ("Setup", "system"),
+        (None, "system"),
+    ]
+    history = client.get(f"/documents/desk.ticket/{ticket['id']}/history", headers=clerk).json()
+    assert [c["actor_name"] for c in history["items"]] == ["Clerk"]
+
+
+def test_a_member_whose_name_is_erased_is_no_longer_named(
+    client: TestClient, kernel: Kernel, provider: IdentityProvider, clerk: dict[str, str]
+) -> None:
+    ana = enrol(kernel, "ana", "desk.*")
+    as_ana = {"Authorization": f"Bearer {provider.token('ana')}"}
+    ticket = open_ticket_now(client, as_ana, "T-1")["result"]
+    path = f"/documents/desk.ticket/{ticket['id']}/history"
+
+    def made_by() -> tuple[str, str | None]:
+        [change] = client.get(path, headers=clerk).json()["items"]
+        return change["actor"], change["actor_name"]
+
+    assert made_by() == (str(ana.id), "Ana")
+    kernel.execute(access.SuspendMember(member_id=ana.id), actor=OWNER)
+    assert made_by() == (str(ana.id), "Ana")
+    kernel.execute(access.EraseMember(member_id=ana.id), actor=OWNER)
+    assert made_by() == (str(ana.id), None)
+
+
+def test_the_names_on_a_page_of_changes_are_read_at_once(
+    client: TestClient, kernel: Kernel, clerk: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for code in ("T-1", "T-2", "T-3"):
+        open_ticket_now(client, clerk, code)
+    kernel.execute(OpenTicket(code="T-4", subject="Opened by the system"), actor=OWNER)
+    asked: list[Query[Any]] = []
+    ask = kernel.ask
+
+    def counted(query: Query[Any], *, actor: Actor) -> Any:
+        asked.append(query)
+        return ask(query, actor=actor)
+
+    monkeypatch.setattr(kernel, "ask", counted)
+    seen = client.get("/changes", headers=clerk).json()["items"]
+    assert len(seen) == 4
+    named = [query for query in asked if isinstance(query, access.ActorNames)]
+    assert [query.actors for query in named] == [(seen[0]["actor"],)], "the system is named here"
+    assert {c["actor_name"] for c in seen} == {"Clerk", "Setup"}
+
+
+def test_following_from_the_feeds_position_sees_only_what_is_new(
+    client: TestClient, clerk: dict[str, str]
+) -> None:
+    open_ticket_now(client, clerk, "T-1")
+    now = client.get("/changes/position", headers=clerk).json()["position"]
+    assert client.get("/changes", headers=clerk, params={"after": now}).json()["items"] == []
+    open_ticket_now(client, clerk, "T-2")
+    after = client.get("/changes", headers=clerk, params={"after": now}).json()["items"]
+    assert [c["action"] for c in after] == ["desk.open_ticket"]
 
 
 def read_stream(
@@ -647,6 +912,7 @@ def test_the_stream_sends_changes_as_they_commit_until_the_token_expires(
         "desk.ticket",
         "desk.ticket",
     ]
+    assert [json.loads(e["data"])["actor_name"] for e in changes] == ["Clerk", "Setup"]
     positions = [int(e["id"]) for e in changes]
     assert positions == sorted(positions)
     assert any(e.get("comment") == "nothing new" for e in events)
@@ -695,7 +961,7 @@ def test_the_audit_trail_needs_its_own_permission(
         "/audit", params={"kind": "desk.ticket", "id": ticket["id"]}, headers=headers
     ).json()
     assert [e["action"] for e in of_ticket["items"]] == ["desk.open_ticket"]
-    assert of_ticket["items"][0]["input"] == {"code": "T-1", "subject": "About T-1"}
+    assert of_ticket["items"][0]["input"] == {"code": "T-1", "subject": "About T-1", "budget": None}
 
     body = problem(
         client.get("/audit", params={"kind": "desk.ticket"}, headers=headers), 422, "rejected"
@@ -735,6 +1001,33 @@ def test_the_openapi_document_is_valid_and_types_every_route(client: TestClient)
     body = paths["/commands/desk.open_ticket"]["post"]["requestBody"]["content"]["application/json"]
     assert body["schema"]["$ref"].endswith("/OpenTicket")
     assert document["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
+
+    listed = paths["/documents/desk.ticket"]["get"]["responses"]["200"]["content"]
+    listing = document["components"]["schemas"][
+        listed["application/json"]["schema"]["$ref"].rpartition("/")[2]
+    ]
+    assert "total" in listing["required"]
+    values = paths["/documents/desk.ticket/values/{field}"]["get"]
+    assert values["summary"] == "Count the values in a field of desk.ticket documents"
+    assert {p["name"] for p in values["parameters"]} == {"field", "where", "search", "limit"}
+    sent = values["responses"]["200"]["content"]["application/json"]["schema"]
+    assert sent["$ref"].endswith("/ValuesSent")
+    counted = document["components"]["schemas"]["CountedSent"]["properties"]["value"]
+    assert {kind.get("type") or kind["$ref"] for kind in counted["anyOf"]} == {
+        "string",
+        "integer",
+        "number",
+        "boolean",
+        "#/components/schemas/Money",
+        "null",
+    }
+
+    history = paths["/documents/desk.ticket/{id}/history"]["get"]
+    assert {p["name"] for p in history["parameters"]} == {"id", "after", "limit"}
+    change = document["components"]["schemas"]["ChangeSent"]
+    assert "actor_name" in change["required"]
+    named = change["properties"]["actor_name"]["anyOf"]
+    assert {kind["type"] for kind in named} == {"string", "null"}
 
 
 # What every request gets.

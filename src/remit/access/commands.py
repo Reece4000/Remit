@@ -1,4 +1,5 @@
-"""The access module's commands, and the query that signs a member in.
+"""The access module's commands, the query that signs a member in, and the query that
+says what members are called.
 
 No one can grant, change or take away what they do not hold themselves. Giving a role,
 taking one, changing what a role grants, and suspending or erasing a member are all
@@ -8,11 +9,15 @@ nor act against someone who holds more than they do.
 """
 
 from collections.abc import Iterable
+from contextlib import suppress
 from typing import Annotated
 from uuid import UUID
 
+from pydantic import Field
+
 from remit.kernel import (
     ERASED,
+    MAX_LIMIT,
     Actor,
     Code,
     Command,
@@ -58,6 +63,7 @@ class DefineRole(Command[Role]):
 class ChangeRole(Command[Role]):
     """Replace a role's name and permissions. Both are required."""
 
+    amends = "role_id"
     role_id: RoleId
     version: int
     """The version the role was read at. Refused if it has changed since."""
@@ -66,6 +72,7 @@ class ChangeRole(Command[Role]):
 
 
 class RetireRole(Command[Role]):
+    moves = "retire"
     role_id: RoleId
 
 
@@ -80,6 +87,7 @@ class EnrolMember(Command[Member]):
 
 
 class RenameMember(Command[Member]):
+    amends = "member_id"
     member_id: MemberId
     version: int
     """The version the member was read at. Refused if it has changed since."""
@@ -97,20 +105,28 @@ class RevokeRole(Command[Member]):
 
 
 class SuspendMember(Command[Member]):
+    moves = "suspend"
     member_id: MemberId
 
 
 class ReinstateMember(Command[Member]):
+    moves = "reinstate"
     member_id: MemberId
 
 
 class EraseMember(Command[Member]):
+    moves = "erase"
     member_id: MemberId
 
 
 class SignIn(Query[Actor | None]):
     issuer: Issuer
     subject: Subject
+
+
+class ActorNames(Query[dict[str, str]]):
+    actors: Annotated[tuple[str, ...], Field(max_length=MAX_LIMIT)]
+    """Actor ids, as `SignIn` gives them: as many as one page of changes can name."""
 
 
 @module.command
@@ -239,6 +255,24 @@ def sign_in(query: SignIn, reader: Reader) -> Actor | None:
         kind=member.kind.actor,
         permissions=frozenset(_granted(_roles(reader, member))),
     )
+
+
+@module.query
+def actor_names(query: ActorNames, reader: Reader) -> dict[str, str]:
+    """What actors are called, by their ids, so that what they did can show who did it.
+
+    People and agents are named alike, suspended or not. Actors who are not members,
+    such as the system, are left out, and so are members whose names have been erased.
+    """
+    ids: list[str] = []
+    for actor in query.actors:
+        # A member acts under their id, so an actor id that is not a UUID is no member's.
+        with suppress(ValueError):
+            ids.append(str(UUID(actor)))
+    if not ids:
+        return {}
+    found = reader.page(Member, where={"id": {"in": ids}}, limit=len(ids))
+    return {str(member.id): member.name for member in found.items if member.state != "erased"}
 
 
 def _granted(roles: Iterable[Role]) -> list[str]:
