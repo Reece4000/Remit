@@ -16,11 +16,22 @@ subscription, and when a handler executes another module's command or asks its q
 A handler reads on the authority of whatever it is handling. The kernel checks an
 actor's permission once, where the actor issues a command or asks to read; what the
 handler then reads in order to answer is not checked again.
+
+A command moves the documents its input refers to only through the transition it
+declares (`Command.moves`), so that what the registry tells a screen about where a
+command applies is true. The context knows which command's handler is running, and
+holds each transition to that command's declaration alone, not to the declaration of
+a command that executed it.
+
+A document's stored body holds the fields of its installed extensions beside its own
+(see `remit.kernel.extension`). Each module writes only the fields it declares: the
+context keeps the extensions' fields as they are stored when the owning module writes
+its document, and the document's own when a module writes its extension.
 """
 
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
@@ -31,15 +42,27 @@ from .actor import Actor
 from .codec import Codec
 from .document import Document
 from .errors import NotFound, Problem, Rejected, RemitError, invalid
+from .extension import Extension, added
 from .message import Command, Event, Query
-from .module import Module
-from .personal import carries_personal, unerased
+from .module import CommandSpec, Module
+from .personal import carries_personal, holds_personal, unerased
 from .reference import references
 from .registry import Registry
-from .selection import DEFAULT_LIMIT, Page, Selection, select
-from .store import Json, Unit
+from .selection import DEFAULT_LIMIT, Page, Selection, defaults, select
+from .store import Json, StoredDocument, Unit
 
 _RESERVED = frozenset({"id", "state", "version"})
+
+
+@dataclass(frozen=True)
+class _Acting:
+    """A command whose handler is running, and the documents its input refers to."""
+
+    spec: CommandSpec
+    moved: str | None
+    """The registered name of the document it may move, if it declares a move."""
+    referred: frozenset[tuple[str, UUID]]
+    """(kind, id) of each document its input refers to."""
 
 
 class Reader:
@@ -63,6 +86,8 @@ class Reader:
         self._settings = settings
         self._modules = [module]
         self._written: dict[tuple[type[Document], UUID], Document] = {}
+        self._extended: dict[tuple[type[Document], UUID], Json] = {}
+        """What each document written holds of its extensions' fields, to be stored with it."""
 
     @property
     def module(self) -> str:
@@ -93,13 +118,28 @@ class Reader:
             raise NotFound(f"there is no {name} with id {id}")
         return self._codec.load(kind, body)
 
+    def extension[X: Extension[Any]](
+        self, kind: type[X], document: UUID | Document, *, version: int | None = None
+    ) -> X:
+        """What an extension adds to a document, given the document or its id, with the
+        document's id and version.
+
+        A field the document has never been given reads as its default. With `version`,
+        refuse if the document has changed since that version, as `get` does.
+        """
+        id = document.id if isinstance(document, Document) else document
+        host = self.get(self._registry.host(kind), id, version=version)
+        held = self._extension_values(type(host), id)
+        return kind.model_validate({**held, "id": id, "version": host.version})
+
     def find[D: Document](self, kind: type[D], /, **equals: object) -> list[D]:
         """Every document whose fields equal the given values, oldest first.
 
         For the rules a handler checks, which must see all of them. To show documents
         to someone, read a `page`.
         """
-        selection = select(self._registry.document_name(kind), kind, where=equals)
+        name, extended = self._registry.document_name(kind), self._registry.extended(kind)
+        selection = select(name, extended, where=equals)
         return [self._codec.load(kind, body) for body in self._select(kind, selection)]
 
     def page[D: Document](
@@ -112,14 +152,16 @@ class Reader:
         after: str | None = None,
         limit: int = DEFAULT_LIMIT,
     ) -> Page[D]:
-        """One page of the documents of a kind, filtered, searched and ordered.
+        """One page of the documents of a kind, filtered, searched and ordered, with how
+        many there are on every page together.
 
-        `where`, `search` and `order` are described in `remit.kernel.selection`. Pass
-        the page's `next` as `after` to read the page that follows it.
+        `where`, `search` and `order` are described in `remit.kernel.selection`, and
+        reach the fields of the kind's extensions as they do its own. Pass the page's
+        `next` as `after` to read the page that follows it.
         """
         selection = select(
             self._registry.document_name(kind),
-            kind,
+            self._registry.extended(kind),
             where=where,
             search=search,
             order=order,
@@ -129,7 +171,8 @@ class Reader:
         # One more than asked for, to learn whether another page follows.
         found = self._select(kind, replace(selection, limit=limit + 1))
         following = selection.cursor(found[limit - 1]) if len(found) > limit else None
-        return Page(tuple(self._codec.load(kind, body) for body in found[:limit]), following)
+        items = tuple(self._codec.load(kind, body) for body in found[:limit])
+        return Page(items, following, self._count(kind, selection))
 
     def ask[R](self, query: Query[R]) -> R:
         """Ask a query inside this unit of work, on the authority of what is running.
@@ -171,8 +214,37 @@ class Reader:
         enough = selection.limit and selection.limit + len(written)
         found = {body["id"]: body for body in self._unit.select(replace(selection, limit=enough))}
         for document in written:
-            found[str(document.id)] = self._codec.dump(document).body
+            found[str(document.id)] = self._stored(document).body
         return selection.arranged(found.values())
+
+    def _count(self, kind: type[Document], selection: Selection) -> int:
+        """How many documents the selection matches, as they will stand once this unit's
+        own writes commit."""
+        counted = self._unit.count(selection)
+        written = [document for (wrote, _), document in self._written.items() if wrote is kind]
+        for document in written:
+            stored = self._unit.get(selection.kind, document.id)
+            if stored is not None and selection.matches(stored):
+                counted -= 1
+            if selection.matches(self._stored(document).body):
+                counted += 1
+        return counted
+
+    def _stored(self, document: Document) -> StoredDocument:
+        """A document this unit has written, as the store is to keep it."""
+        extended = self._extended.get((type(document), document.id))
+        return self._codec.dump(document, extended=extended)
+
+    def _extension_values(self, kind: type[Document], id: UUID) -> Json:
+        """What a document holds of its extensions' fields, as stored, as this unit stands.
+        A document not yet stored holds none."""
+        if (held := self._extended.get((kind, id))) is not None:
+            return held
+        extensions = self._registry.extensions(kind)
+        if not extensions:
+            return {}
+        body = self._unit.get(self._registry.document_name(kind), id) or {}
+        return {f: body[f] for extension in extensions for f in added(extension) if f in body}
 
     @contextmanager
     def _running(self, module: str) -> Generator[None]:
@@ -207,10 +279,16 @@ class Context(Reader):
         self._read_versions: dict[tuple[type[Document], UUID], int] = {}
         self._emitted: list[Event] = []
         self._erasures: dict[UUID, type[Document]] = {}
+        self._acting: list[_Acting] = []
 
     @property
     def written(self) -> tuple[Document, ...]:
         return tuple(self._written.values())
+
+    @property
+    def stored(self) -> tuple[StoredDocument, ...]:
+        """Every document written, as the store is to keep it: with its extensions' fields."""
+        return tuple(self._stored(document) for document in self._written.values())
 
     @property
     def emitted(self) -> tuple[Event, ...]:
@@ -242,6 +320,7 @@ class Context(Reader):
         # and runs as whichever module the unit is running.
         reader._modules = self._modules
         reader._written = self._written
+        reader._extended = self._extended
         return reader
 
     def create[D: Document](self, document: D) -> D:
@@ -254,17 +333,29 @@ class Context(Reader):
             raise Rejected(f"there is already a {name} with id {document.id}")
         return self._write(document)
 
-    def update[D: Document](self, document: D, /, **changes: object) -> D:
-        """Change fields without changing state. Final documents cannot be updated."""
-        self._require_current(document)
-        if document.is_final:
-            name = self._registry.document_name(type(document))
-            raise Rejected(f"{name} {document.id} is {document.state} and can no longer change")
-        return self._write(self._revise(document, changes))
+    def update[T: Document | Extension[Any]](self, held: T, /, **changes: object) -> T:
+        """Change fields without changing state. Final documents cannot be updated.
+
+        Given an extension, change its fields, which are the document's, so the document's
+        version moves on. Only the module that declares the extension can.
+        """
+        document = self._require_current(held)
+        self._require_open(document)
+        if not isinstance(held, Extension):
+            return self._write(self._revise(held, changes))
+        extension = self._revise(held, changes)
+        name = self._registry.extension_name(type(extension))
+        self._require_owner(self._registry.extension_owner(type(extension)).name, f"write {name}")
+        self._require_referenced(extension, self._registry.document_name(type(document)))
+        key = (type(document), document.id)
+        own = extension.model_dump(mode="json", include=set(added(type(extension))))
+        self._extended[key] = {**self._extension_values(*key), **own}
+        return extension.model_copy(update={"version": self._hold(document).version})
 
     def transition[D: Document](self, document: D, name: str, /, **changes: object) -> D:
         """Move a document along its lifecycle, optionally filling in fields as it goes."""
         self._require_current(document)
+        self._require_declared(document, name)
         step = document.lifecycle.find(name, document.state)
         revised = self._revise(document, changes, state=step.target)
         missing = [field for field in step.requires if _blank(getattr(revised, field))]
@@ -276,32 +367,46 @@ class Context(Reader):
             )
         return self._write(revised)
 
-    def revise[D: Document](self, document: D, /, **changes: object) -> tuple[D, tuple[str, ...]]:
-        """Replace some of a document's fields, refusing if none would change.
+    def revise[T: Document | Extension[Any]](
+        self, held: T, /, **changes: object
+    ) -> tuple[T, tuple[str, ...]]:
+        """Replace some of a document's fields, or an extension's, refusing if none would
+        change.
 
-        Returns the revised document and the names of the fields that changed, in the
-        order given, for the event that reports the change.
+        Returns the revised copy and the names of the fields that changed, in the order
+        given, for the event that reports the change.
         """
-        changed = tuple(
-            field for field, value in changes.items() if getattr(document, field) != value
-        )
+        changed = tuple(field for field, value in changes.items() if getattr(held, field) != value)
         if not changed:
-            name = self._registry.document_name(type(document))
-            raise Rejected(f"nothing would change: {name} {document.id} already has these details")
-        return self.update(document, **changes), changed
+            name = self._registry.document_name(self._document_type(type(held)))
+            raise Rejected(f"nothing would change: {name} {held.id} already has these details")
+        return self.update(held, **changes), changed
 
     def erase(self, document: Document) -> None:
         """Erase what the audit trail holds about this data subject, when this unit commits.
 
         Replace the document's personal fields first (with `ERASED`, null or empty): the
         audit trail's copies become unreadable, and the live document must not keep them.
+        Fields its extensions add that hold personal data are returned to their defaults,
+        which hold none, since the module erasing it knows nothing of them.
         """
         kind = type(document)
         name = self._registry.document_name(kind)
         self._require_owner(self._registry.document_owner(kind).name, f"erase {name}")
         if not carries_personal(kind):
             raise RemitError(f"{name} holds no personal data to erase")
-        self._require_erased(self.get(kind, document.id))
+        current = self.get(kind, document.id)
+        cleared = {
+            field: defaults(extension)[field]
+            for extension in self._registry.extensions(kind)
+            for field in added(extension)
+            if holds_personal(extension.model_fields[field])
+        }
+        held = self._extension_values(kind, current.id)
+        if any(held.get(field, default) != default for field, default in cleared.items()):
+            self._extended[kind, current.id] = {**held, **cleared}
+            current = self._write(current)
+        self._require_erased(current)
         self._erasures[document.id] = kind
 
     def emit(self, event: Event) -> None:
@@ -311,15 +416,48 @@ class Context(Reader):
         self._emitted.append(event)
 
     def execute[R](self, command: Command[R]) -> R:
-        """Run another command inside this unit of work, on this command's authority.
+        """Run a command inside this unit of work, on the authority of what is running.
 
         The command may belong to this module or to one it requires. Its handler runs
-        as its own module, so it writes that module's documents.
+        as its own module, so it writes that module's documents, and is held to the
+        move its command declares.
         """
         spec = self._registry.command(type(command))
         self._require_reach(self._registry.modules[spec.module], f"execute {spec.name}")
-        with self._running(spec.module):
+        with self._running(spec.module), self._acting_on(spec, command):
             return spec.handler(command, self)
+
+    @contextmanager
+    def _acting_on(self, spec: CommandSpec, command: Command[Any]) -> Generator[None]:
+        referred = frozenset((found.document, found.id) for found in references(command))
+        self._acting.append(_Acting(spec, self._registry.moved(spec), referred))
+        try:
+            yield
+        finally:
+            self._acting.pop()
+
+    def _require_declared(self, document: Document, transition: str) -> None:
+        """A command takes a document its input refers to only through the move it declares.
+
+        A mistake in the module, not a refusal: raised where it happens, so that the
+        module's own tests find it.
+        """
+        if not self._acting:
+            return
+        acting = self._acting[-1]
+        kind = self._registry.document_name(type(document))
+        if (kind, document.id) not in acting.referred:
+            return
+        declared = acting.spec.command.moves
+        if (kind, transition) == (acting.moved, declared):
+            return
+        took = f"{acting.spec.name} took {kind}, which its input refers to, through {transition!r}"
+        command = acting.spec.command.__name__
+        if declared is None:
+            raise RemitError(f"{took}; declare moves = {transition!r} on {command}")
+        raise RemitError(
+            f"{took}, but {command} declares moves = {declared!r}, a transition of {acting.moved}"
+        )
 
     def _require_owner(self, owner: str, action: str) -> None:
         if owner != self.module:
@@ -329,25 +467,36 @@ class Context(Reader):
             )
 
     def _require_erased(self, document: Document) -> None:
-        if kept := unerased(document):
+        extensions = self._registry.extensions(type(document))
+        views = [self.extension(extension, document) for extension in extensions]
+        if kept := [field for held in (document, *views) for field in unerased(held)]:
             name = self._registry.document_name(type(document))
             raise RemitError(
                 f"replace {name}'s personal fields before erasing it: {', '.join(kept)}"
             )
 
-    def _require_current(self, document: Document) -> None:
-        if self.get(type(document), document.id).version != document.version:
+    def _require_current(self, held: Document | Extension[Any]) -> Document:
+        """The document as this unit holds it, refusing a copy of it, or of what an
+        extension adds to it, from before the unit last changed it."""
+        document = self.get(self._document_type(type(held)), held.id)
+        if document.version != held.version:
             raise RemitError(
-                f"{type(document).__name__} {document.id} was changed earlier in this unit of "
+                f"{type(held).__name__} {held.id} was changed earlier in this unit of "
                 "work; use the copy that change returned"
             )
+        return document
 
-    def _require_referenced(self, document: Document) -> None:
-        for found in references(document):
+    def _require_open(self, document: Document) -> None:
+        if document.is_final:
+            name = self._registry.document_name(type(document))
+            raise Rejected(f"{name} {document.id} is {document.state} and can no longer change")
+
+    def _require_referenced(self, held: Document | Extension[Any], name: str) -> None:
+        """What a document, or an extension of one named `name`, refers to exists."""
+        for found in references(held):
             try:
                 self._get(self._registry.document_type(found.document), found.id)
             except NotFound:
-                name = self._registry.document_name(type(document))
                 where = ".".join(map(str, found.path))
                 missing = f"there is no {found.document} with id {found.id}"
                 raise Rejected(
@@ -366,27 +515,45 @@ class Context(Reader):
     def _write[D: Document](self, document: D) -> D:
         name = self._registry.document_name(type(document))
         self._require_owner(self._registry.document_owner(type(document)).name, f"write {name}")
-        self._require_referenced(document)
+        self._require_referenced(document, name)
         self._require_unique(document)
+        return self._hold(document)
+
+    def _hold[D: Document](self, document: D) -> D:
+        """Hold a document to be stored when the unit commits, at the version after the one
+        it was first read at in this unit."""
         key = (type(document), document.id)
+        if key not in self._extended:
+            # The module writing a document owns its own fields, not its extensions', which
+            # are kept as they are stored.
+            self._extended[key] = self._extension_values(*key)
         read_version = self._read_versions.setdefault(key, document.version)
         written = document.model_copy(update={"version": read_version + 1})
         self._written[key] = written
         return written
 
-    def _revise[D: Document](
-        self, document: D, changes: dict[str, object], **kernel_set: object
-    ) -> D:
+    def _revise[T: Document | Extension[Any]](
+        self, held: T, changes: dict[str, object], **kernel_set: object
+    ) -> T:
+        model = type(held)
         if reserved := _RESERVED & changes.keys():
             raise RemitError(f"{', '.join(sorted(reserved))} are managed by the kernel")
-        if unknown := changes.keys() - type(document).model_fields.keys():
-            name = self._registry.document_name(type(document))
-            raise RemitError(f"{name} has no fields {', '.join(sorted(unknown))}")
+        if unknown := changes.keys() - model.model_fields.keys():
+            declared = (
+                self._registry.extension_name(model)
+                if issubclass(model, Extension)
+                else self._registry.document_name(model)
+            )
+            raise RemitError(f"{declared} has no fields {', '.join(sorted(unknown))}")
         try:
-            return type(document).model_validate({**dict(document), **changes, **kernel_set})
+            return model.model_validate({**dict(held), **changes, **kernel_set})
         except ValidationError as error:
-            name = self._registry.document_name(type(document))
-            raise invalid(f"{name} {document.id}", error, document=name) from None
+            name = self._registry.document_name(self._document_type(model))
+            raise invalid(f"{name} {held.id}", error, document=name) from None
+
+    def _document_type(self, model: type[Document] | type[Extension[Any]]) -> type[Document]:
+        """The document type itself, or the one an extension extends."""
+        return self._registry.host(model) if issubclass(model, Extension) else model
 
 
 def _blank(value: object) -> bool:

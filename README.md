@@ -32,7 +32,9 @@ entry in the audit trail.
   reading. `ledger.read.*` lets a role read the ledger and change nothing; `ledger.*`
   grants both; `*.read.*` suits an auditor.
 - **Every kind of document can be listed, with nothing written for it.** One call
-  filters, searches, orders and pages any of them, and means the same on every store.
+  filters, searches, orders and pages any of them, saying how many there are, and means
+  the same on every store. Another counts the values a field holds, for a filter's
+  choices.
   Reads that take code, such as a trial balance, are declared as queries, with a
   docstring, a typed input and a typed result, exactly as commands are.
 - **Everything installed is served over HTTP, with nothing written for it.** Each
@@ -66,8 +68,10 @@ entry in the audit trail.
 - **Modules build on modules.** A module declares the modules it requires, may use
   only their public API and react only to their events, and brings them with it when
   installed. It writes only its own documents: to change another module's, it executes
-  that module's commands. Remit's own standard modules follow the same rules as anyone
-  else's.
+  that module's commands. It can add fields of its own to another module's document,
+  which are stored, listed and served with the document's, and written only by the
+  module that added them. Remit's own standard modules follow the same rules as anyone
+  else's. See [extensions](docs/extensions.md).
 - **Money is exact.** Currencies and their minor units come from the ISO 4217 table as
   published, an amount never mixes currencies, and arithmetic never rounds except where
   a rounding mode is named (`times`, `convert`, `allocate`).
@@ -80,9 +84,20 @@ entry in the audit trail.
 A module declares its documents, events and commands:
 
 ```python
+from typing import Annotated
 from uuid import UUID
 
-from remit.kernel import Command, Context, Document, Event, Lifecycle, Module, Transition
+from remit.kernel import (
+    Command,
+    Context,
+    Document,
+    Event,
+    Extension,
+    Lifecycle,
+    Module,
+    References,
+    Transition,
+)
 
 shipping = Module("shipping")
 
@@ -116,7 +131,8 @@ class PackConsignment(Command[Consignment]):
 
 
 class BookConsignment(Command[Consignment]):
-    consignment_id: UUID
+    moves = "book"
+    consignment_id: Annotated[UUID, References("shipping.consignment")]
     carrier: str | None = None
     waybill: str | None = None
 
@@ -137,6 +153,52 @@ def book_consignment(command: BookConsignment, context: Context) -> Consignment:
     context.emit(ConsignmentBooked(consignment_id=booked.id))
     return booked
 ```
+
+`moves` names the transition a command may take the document it acts on through: of
+the documents its input refers to, the one whose lifecycle has that transition. The
+registry describes it, so a screen offers to book a consignment only while it is packed.
+The move may depend on what the handler finds, as when issuing stock uses a batch up
+only if it takes the last of it. Any other transition of a document the input refers to
+is an error in the module, raised as it happens, so the module's tests find a
+declaration that has drifted from what the command does.
+
+`amends` marks a command that replaces some of a document's fields, naming the field of
+its input that refers to the document: `amends = "item_id"` on `AmendItem`. The command
+carries the `version` the document was read at, and its other fields are the
+document's own, declared the same way, which the registry checks. So a screen can edit
+those fields in place, copying each value from the document and sending it back.
+
+A document that is a line of another names the field that refers to it, as
+`part_of = "quotation_id"` does on a quotation's line, so that a screen shows lines
+inside the document they belong to.
+
+A reference can say which documents are worth offering for it, given what is beside
+it: `References("sales.sales_order_line", where={"sales_order_id":
+"purchase_order_id.sales_order_id"})` offers the lines of the sales order a purchase
+order was raised for, rather than every line of every order. A path starts at a field
+beside the reference and may go on into the document that field refers to; one that
+leads to nothing narrows nothing. It narrows what a screen offers and an agent looks
+among, not what the command accepts, and the registry checks at startup that each path
+can be followed.
+
+A module adds fields to another module's document with an extension, which it alone
+writes. The fields are stored in the document, so it keeps one version and one history,
+and are listed, described and served with the document's own:
+
+```python
+customs = Module("customs", requires=(shipping,))
+
+
+@customs.extension
+class ConsignmentCustoms(Extension[Consignment]):
+    """What customs needs to know about a consignment."""
+
+    export_licence: str | None = None
+    declared: bool = False
+```
+
+See [extensions](docs/extensions.md) for when to use one rather than a line or a
+document of its own.
 
 An actor, here an agent, works through the kernel:
 
@@ -220,12 +282,14 @@ page = kernel.page(
     ledger.JournalEntry,
     actor=auditor,
     where={"posting_date": {"gte": "2026-01-01", "lt": "2026-02-01"}},
-    order="-posting_date",
+    order="-posting_date,description",
     limit=50,
 )
+page.total  # how many entries January holds, on every page together
 following = kernel.page(..., after=page.next)  # the same listing, continued
 
 kernel.page(ledger.Account, actor=auditor, search="receiv")  # finds "Receivables (USD)"
+kernel.values(ledger.Account, "type", actor=auditor)  # each type of account, and how many
 kernel.ask(ledger.TrialBalance(as_of=date(2026, 1, 31)), actor=auditor)
 ```
 
@@ -234,16 +298,36 @@ kernel.ask(ledger.TrialBalance(as_of=date(2026, 1, 31)), actor=auditor)
   compare as dates, amounts as numbers and times as instants, and a misspelt field is
   refused instead of matching nothing. Every fault in a listing is reported at once,
   each against the part at fault.
+- **Money** is filtered with money, as documents hold it:
+  `{"total": {"gte": {"currency": "GBP", "amount": "100"}}}`, or
+  `{"total": {"currency": "GBP", "amount": "100"}}` to equal it. `eq`, `ne` and `in`
+  compare currency and amount exactly. `gt`, `gte`, `lt` and `lte` find only amounts in
+  the currency given, since a hundred pounds is neither more nor less than a hundred
+  euros. Money is ordered by currency and then by amount, so a listing in one currency
+  is ordered by amount, and one in several is grouped by currency.
 - **`search`** looks in the fields a document declares `searchable`. It finds the
   documents holding every word of the search, whatever the case, accents or width
   (`muller` finds `Müller`), and puts exact matches first, then those that start with
   the search. On PostgreSQL a trigram index (`pg_trgm`, which ships with it) makes that
   fast. The index does not decide what matches: the kernel does, so tests on the
   memory store predict production.
-- **`order`** names one field, `-` first for descending. Ties are broken by id, which
-  is also the order of creation.
+- **`order`** names fields separated by commas, most significant first, each with `-`
+  first for descending. Documents that tie on all of them are ordered by id, which is
+  also the order of creation, in the direction of the last field named. Naming `id`
+  sets its direction instead, and ends the order.
 - **`after`** takes the previous page's `next`. Pages are reached by cursor, so
   documents added between two pages are neither skipped nor repeated.
+- **`total`**, on every page, is how many documents the listing holds: all that `where`
+  and `search` find, wherever the page starts and however long it is.
+
+`values` counts what one field holds across a listing, for a screen to offer as the
+choices of a filter: each value once, with how many documents hold it, null first and
+then lowest to highest. It takes the same `where` and `search`, and any field `where`
+can filter on. Values a filter finds equal are counted as one, such as an amount
+written `10.5` and `10.50`, or one instant written in two time zones, so that each count
+is how many documents filtering on that value finds. Each comes back as documents hold
+it: ids, dates and enumerations as text, and money as money, with its currency and its
+amount.
 
 A query is declared like a command, and its handler is given a reader, which has no
 means of writing:
@@ -296,10 +380,11 @@ curl -sN localhost:8000/changes/stream -H "Authorization: Bearer $token"
 | Route | What it does |
 |---|---|
 | `POST /commands/{name}` | Runs a command. `Idempotency-Key` makes a retry safe; `?dry_run=true` changes nothing. |
-| `GET /documents/{kind}` | Lists documents: `where` (JSON), `search`, `order`, `after`, `limit`. |
+| `GET /documents/{kind}` | Lists documents: `where` (JSON), `search`, `order`, `after`, `limit`. Each page gives the `total`. |
+| `GET /documents/{kind}/values/{field}` | Counts the values a field holds across a listing (`where`, `search`), as a filter's choices; `limit` is 100 unless given, and at most 500. |
 | `GET /documents/{kind}/{id}` | Reads one, with its version as its `ETag`. `/history` lists what wrote it. |
 | `POST /queries/{name}` | Asks a query. It changes nothing; its input is a body. |
-| `GET /changes`, `GET /changes/stream` | Follows what is written, as pages or as server-sent events. |
+| `GET /changes`, `GET /changes/stream` | Follows what is written, as pages or as server-sent events. Each change, here and in a document's `/history`, gives the `actor` and their `actor_name`: a person or an agent as the access module knows them, the system in words from its id (`Setup` for `system:setup`), and null once a member's name is erased. |
 | `GET /audit`, `GET /events` | The audit trail, of everything or one document, and the event log. |
 | `GET /registry`, `GET /me` | What is installed, and who is asking and what they may do. |
 | `GET /openapi.json`, `GET /docs` | The OpenAPI 3.2 document, and a page to try it from. |
@@ -330,8 +415,8 @@ seconds however many unknown keys are sent. Providers on plain http are refused 
 | Posted entries, the event log and the audit trail cannot be altered or emptied | Database triggers on rows and on TRUNCATE, as well as the kernel | Tests that write to the tables directly and expect refusal |
 | Nothing changes except through a command | Writes go only through the kernel's commit; reads run in read-only transactions, and a query's handler is given no means of writing | Updates, inserts and deletes sent through a query; the reader a command's query is handed |
 | Nothing is read without permission to read it | Every read through the kernel names an actor and is checked; there is no unchecked read | Actors without the permission, for documents, queries, the audit trail and ids that do not exist |
-| A listing means the same on every store | One definition, in Python; PostgreSQL's SQL is held to it | Hundreds of random listings, paged through on both stores and compared |
-| Paging neither skips nor repeats documents as others are added | Cursors mark a place in the order, and continue only the listing that gave them | Documents added between pages; cursors forged, or taken to another listing |
+| A listing means the same on every store | One definition, in Python; PostgreSQL's SQL is held to it | Hundreds of random listings, filtered and ordered by up to three fields, money among them, paged through on both stores and compared, with their totals and the values they count |
+| Paging neither skips nor repeats documents as others are added | Cursors mark a place in the order, and continue only the listing that gave them | Documents added between pages; orders of several fields, with nulls and ties, paged a few at a time and compared with a sort made by the test; cursors forged, or taken to another listing |
 | Search reads only what the document now holds | What is searched is written with the document, and rebuilt on install when a module declares it differently | Searching for the erased; the search table read directly; reinstalls |
 | Nothing is posted into a closed period | The ledger's commands and a database trigger | Both of the above |
 | Each event takes effect once per subscription | The subscription's cursor commits with its effects | Several workers dispatching the same events at once |
@@ -345,6 +430,8 @@ seconds however many unknown keys are sent. Providers on plain http are refused 
 | No one grants, changes or takes away permissions they do not hold | The access module's commands | Managers defining, granting, widening and revoking above themselves |
 | A module imports, and reacts to events from, only the modules it requires | An architecture test over every import; the registry, for subscriptions | Modules that try to react to undeclared events |
 | A module writes only its own documents and emits only its own events | The unit of work, which knows whose code is running | Commands and subscriptions that write another module's documents or emit its events |
+| A module's fields on another module's document are written only by that module, and each module's writes keep the other's fields | The unit of work, which writes the document's fields and each extension's separately into one body; the registry, which refuses fields that clash | Owners and extensions writing in turn; a third module's write; final documents; out-of-date copies from either side |
+| A command moves the documents its input refers to only through the transition it declares | The unit of work, which knows whose command is running; the registry, for declarations that name no transition or more than one document's | Undeclared and different transitions, by commands run alone and by other commands; documents the input does not refer to; moves made only sometimes |
 | One subscription's failure never stops another's delivery | Each delivery is its own unit of work, and any error in it is recorded, not raised | Subscriptions that raise refusals and ordinary Python errors |
 | Personal data in the audit trail is unreadable once its subject is erased, and never stored in the clear | Encryption under per-subject keys, and registration refuses personal data in events | Raw tables searched for personal values; erasure through nested data and replays |
 | A kernel runs only modules its database was installed with, as currently defined | Each install records a fingerprint of the kernel's and each module's migrations, rules and unique fields | Kernels started against missing or changed installs |
@@ -384,9 +471,9 @@ And some things reading does not do yet:
 - Text is ordered by code point, which every store agrees on and no upgrade can
   change: capitals sort before lower case, and accented letters after `z`.
 - A listing ordered by anything but id is sorted by the database on each request, with
-  no index of its own. That suits kinds with hundreds of thousands of documents, not
-  hundreds of millions.
-- A listing does not count how many documents match.
+  no index of its own, and its total and the values of its fields are counted afresh
+  each time they are asked for. That suits kinds with hundreds of thousands of
+  documents, not hundreds of millions.
 - Search does not forgive misspellings.
 
 And some things the server does not do yet:
@@ -450,10 +537,10 @@ Kernel tests run in memory and on PostgreSQL; ledger tests need PostgreSQL. Runn
 | `src/remit/ledger` | General ledger: accounts, journal entries, reversals, period closes. Built only on the kernel's public API. `books.py` is the bridge to pgledger, `rules.sql` holds what the database enforces, `vendor/pgledger` is pgledger v0.9.0 itself, unmodified. |
 | `src/remit/server` | The REST API, token verification, the worker, and the `remit` command. A client of the kernel, built on public APIs only. |
 | `Dockerfile`, `compose.yaml`, `deploy` | The container image, everything running on one machine, and the local Keycloak's realm. |
-| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands; the API driven with signed tokens. |
+| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands; the API driven with signed tokens; Kestrel's month. |
 | `checks` | The mutation checks behind `./check --deep`. |
-| `docs` | Design notes: [modules and templates](docs/modules-and-templates.md), [personal data](docs/personal-data.md). |
-| `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. |
+| `docs` | Design notes: [modules and templates](docs/modules-and-templates.md), [extensions](docs/extensions.md), [personal data](docs/personal-data.md). |
+| `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. One runs: [Kestrel Animal Health](examples/kestrel-animal-health), with its own modules, people and a month to play through. |
 
 Three layering rules are enforced by a test: the kernel imports no module, a module
 imports only `remit.kernel` and the top-level packages of the modules it requires, and
@@ -466,10 +553,10 @@ the server imports only those public APIs.
    container image. Next: an MCP server generated from the registry in the same way, and
    recording who instructed an agent.
 2. **Controls.** Roles, limits per role, approval steps and segregation of duties.
-3. **More kernel primitives.** Modules that add fields to, and refuse transitions of,
-   documents they do not own; links between the lines of related
-   documents; rules held as data; documents rendered through versioned templates; and a
-   query layer for reporting.
+3. **More kernel primitives.** Built: modules that add fields to documents they do not
+   own. Next: modules that refuse transitions of documents they do not own; links
+   between the lines of related documents; rules held as data; documents rendered
+   through versioned templates; and a query layer for reporting.
 4. **Business content.** Standard modules (parties, items, pricing, tax, banking, sales,
    purchasing, inventory), built exactly as any third-party module would be, and
    templates that give a new business a working starting point. See

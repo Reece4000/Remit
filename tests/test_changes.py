@@ -160,8 +160,19 @@ def test_the_changes_feed_shows_each_reader_only_what_they_may_read(kernel: Kern
         ("depot.load", (("depot.crate", pears.id, 1),)),
         ("depot.relabel", (("depot.crate", apples.id, 2),)),
     ]
-    assert all(change.actor == "clerk" for change in seen.items)
+    assert all((c.actor, c.actor_kind) == ("clerk", ActorKind.HUMAN) for c in seen.items)
     assert seen.position == everything.position == kernel.audit(actor=ROOT)[-1].position
+
+
+def test_following_from_the_feeds_position_sees_only_what_is_new(kernel: Kernel) -> None:
+    assert kernel.position(actor=NOBODY) == 0
+    stock(kernel)
+    now = kernel.position(actor=NOBODY)
+    assert now == kernel.audit(actor=ROOT)[-1].position
+    assert kernel.changes(actor=CLERK, after=now).items == ()
+
+    kernel.execute(Load(label="F1", contents="figs"), actor=CLERK)
+    assert [c.action for c in kernel.changes(actor=CLERK, after=now).items] == ["depot.load"]
 
 
 def test_reading_on_through_the_feed_always_advances(kernel: Kernel) -> None:

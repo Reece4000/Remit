@@ -67,12 +67,13 @@ def invalid(subject: str, error: ValidationError, *, document: str | None = None
 
 
 def said(found: ErrorDetails) -> str:
-    """What was wrong, in the validator's own words when a validator refused the value.
+    """What was wrong, as pydantic words it, with whatever context it gave filled in.
 
-    Pydantic prefixes those with "Value error, ", which reads as noise beside a field.
+    Pydantic prefixes what a validator's own `ValueError` says with "Value error, ",
+    which reads as noise beside a field.
     """
-    if found["type"] == "value_error" and "ctx" in found:
-        return str(found["ctx"]["error"])
+    if found["type"] == "value_error":
+        return found["msg"].removeprefix("Value error, ")
     return found["msg"]
 
 

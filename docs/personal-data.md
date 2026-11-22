@@ -71,7 +71,10 @@ A module erases a subject in two steps, in one unit of work:
 
 `context.erase` refuses while any personal value remains in the document, at any
 depth, and the kernel checks again when the handler returns, so that a write after the
-call cannot put a value back. Only the module that owns the document can erase it. When
+call cannot put a value back. Personal fields that other modules add to the document
+through [extensions](extensions.md) are returned to their defaults, which hold nothing,
+so the module erasing the document need not know of them. Only the module that owns
+the document can erase it. When
 the unit commits, every data key linked to the subject is deleted. Older
 audit entries then read back with `"[erased]"` in place of the personal values. An
 idempotency record whose key was deleted cannot be replayed, so a retry is refused and
@@ -97,4 +100,6 @@ partly unreadable, but never the reverse.
   the text of each document's searchable fields, without case or accents. That row is
   rewritten whenever its document is, so an erased name can no longer be searched for.
 - **Who may read personal data.** Anyone permitted to read a kind of document reads all
-  of its fields. Withholding personal fields from some readers is not built.
+  of its fields. Withholding personal fields from some readers is not built. Members'
+  names reach further: the API names whoever made each change to anyone who may read
+  what was changed, so that a document's history says who did what.

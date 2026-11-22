@@ -5,12 +5,13 @@ source everything outside the kernel (API schema, agent tools, docs) is generate
 """
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
 from .document import Document
 from .errors import RegistrationError
+from .extension import Extension, added, extended, extends, reserved
 from .message import Command, Event, Query
 from .module import (
     KERNEL,
@@ -21,9 +22,9 @@ from .module import (
     installation_order,
     read_permission,
 )
-from .personal import carries_personal, unsealable, unsealable_result
-from .reference import declared, misplaced
-from .selection import holds_text, listing
+from .personal import carries_personal, holds_personal, is_erased, unsealable, unsealable_result
+from .reference import declared, misplaced, refers_to, unnarrowable
+from .selection import defaults, holds_text, listing
 
 READ_AUDIT = read_permission(f"{KERNEL}.audit")
 """The permission to read the audit trail, which holds every command's input."""
@@ -38,12 +39,20 @@ class Registry:
         self._documents: dict[type[Document], str] = {}
         self._document_types: dict[str, type[Document]] = {}
         self._document_owners: dict[type[Document], Module] = {}
+        self._extensions: dict[type[Extension[Any]], str] = {}
+        self._extension_owners: dict[type[Extension[Any]], Module] = {}
+        self._extension_hosts: dict[type[Extension[Any]], type[Document]] = {}
+        self._extending: dict[type[Document], list[type[Extension[Any]]]] = {}
+        self._extended: dict[type[Document], type[Document]] = {}
+        """Each document type something extends, to the type with the extensions' fields."""
+        self._unextended: dict[type[Document], type[Document]] = {}
         self._events: dict[type[Event], str] = {}
         self._event_owners: dict[type[Event], Module] = {}
         self._commands: dict[type[Command[Any]], CommandSpec] = {}
         self._command_names: dict[str, CommandSpec] = {}
         self._queries: dict[type[Query[Any]], QuerySpec] = {}
         self._query_names: dict[str, QuerySpec] = {}
+        self._moved: dict[str, str] = {}
 
         for module in installation_order(modules):
             if module.name in self.modules:
@@ -57,6 +66,15 @@ class Registry:
                 self._documents[document] = name
                 self._document_types[name] = document
                 self._document_owners[document] = module
+            for name, extension in module.extensions.items():
+                _check_unclaimed(name, self._extensions.get(extension))
+                host = self._check_extension(module, name, extension)
+                _check_searchable(name, extension)
+                _check_sealable(name, extension)
+                self._extensions[extension] = name
+                self._extension_owners[extension] = module
+                self._extension_hosts[extension] = host
+                self._extending.setdefault(host, []).append(extension)
             for name, event in module.events.items():
                 _check_unclaimed(name, self._events.get(event))
                 _check_sealable(name, event)
@@ -84,6 +102,11 @@ class Registry:
                 self._queries[query.query] = query
                 self._query_names[query.name] = query
 
+        for host, extensions in self._extending.items():
+            declared_by = [(self._extension_owners[e].name, e) for e in extensions]
+            self._extended[host] = extended(host, declared_by)
+            self._unextended[self._extended[host]] = host
+
         self.subscriptions: tuple[Subscription, ...] = tuple(
             subscription
             for module in self.modules.values()
@@ -93,9 +116,43 @@ class Registry:
             self._check_reach(subscription)
         for module in self.modules.values():
             self._check_references(module)
+            for name, document in module.documents.items():
+                if document.part_of is not None:
+                    _check_part_of(name, document, document.part_of)
+            for spec in module.commands.values():
+                if spec.command.moves is not None:
+                    self._moved[spec.name] = self._check_moves(spec, spec.command.moves)
+                if spec.command.amends is not None:
+                    self._check_amends(spec, spec.command.amends)
 
     def document_name(self, kind: type[Document]) -> str:
-        return _resolve(self._documents, kind, "document")
+        """The name a document type is registered as, which is also its extended type's."""
+        return _resolve(self._documents, self._unextended.get(kind, kind), "document")
+
+    def extended[D: Document](self, kind: type[D]) -> type[D]:
+        """The document type with every installed extension's fields beside its own: what
+        its stored body holds, and what is listed and described. The type itself when
+        nothing extends it.
+
+        For reading only. A module writes the type it declares, and an extension writes
+        its own fields.
+        """
+        return cast(type[D], self._extended.get(kind, kind))
+
+    def extensions(self, kind: type[Document]) -> tuple[type[Extension[Any]], ...]:
+        """The installed extensions of a document type, in the order they were installed."""
+        return tuple(self._extending.get(kind, ()))
+
+    def extension_name(self, kind: type[Extension[Any]]) -> str:
+        return _resolve(self._extensions, kind, "extension")
+
+    def extension_owner(self, kind: type[Extension[Any]]) -> Module:
+        """The module that declares this extension, and alone may write its fields."""
+        return _resolve(self._extension_owners, kind, "extension")
+
+    def host(self, kind: type[Extension[Any]]) -> type[Document]:
+        """The document type this extension extends."""
+        return _resolve(self._extension_hosts, kind, "extension")
 
     def event_name(self, kind: type[Event]) -> str:
         return _resolve(self._events, kind, "event")
@@ -106,6 +163,10 @@ class Registry:
     def find_command(self, name: str) -> CommandSpec | None:
         """The command registered as `name`, such as `parties.register_party`, if any."""
         return self._command_names.get(name)
+
+    def moved(self, spec: CommandSpec) -> str | None:
+        """The registered name of the document the command may move, if it declares a move."""
+        return self._moved.get(spec.name)
 
     def query(self, kind: type[Query[Any]]) -> QuerySpec:
         return _resolve(self._queries, kind, "query")
@@ -158,8 +219,10 @@ class Registry:
             *(spec.command for spec in module.commands.values()),
             *(spec.query for spec in module.queries.values()),
         )
-        for model in (*module.documents.values(), *module.events.values(), *messages):
-            if reason := misplaced(model):
+        declarations = (*module.documents.values(), *module.extensions.values())
+        documents = {name: kind for kind, name in self._documents.items()}
+        for model in (*declarations, *module.events.values(), *messages):
+            if reason := misplaced(model) or unnarrowable(model, documents):
                 raise RegistrationError(reason)
             for where, document in declared(model):
                 if document not in names:
@@ -167,6 +230,136 @@ class Registry:
                         f"{where} refers to {document}, which is not a document of "
                         f"{module.name} or of a module it requires"
                     )
+
+    def _check_extension(
+        self, module: Module, name: str, extension: type[Extension[Any]]
+    ) -> type[Document]:
+        """The document an extension extends: one of a module this one requires, to which
+        it adds fields of its own, each with a default, holding personal data only if the
+        document is a data subject already."""
+        host = extends(extension)
+        if host is None:
+            raise RegistrationError(
+                f"{name} names no document to extend; declare it as "
+                f"{extension.__name__}(Extension[TheDocument])"
+            )
+        document = self._documents.get(host)
+        if document is None:
+            raise RegistrationError(
+                f"{name} extends {host.__name__}, which is not a document of an installed module"
+            )
+        owner = self._document_owners[host]
+        if owner is module:
+            raise RegistrationError(
+                f"{name} extends {document}, a document of {module.name} itself; declare its "
+                "fields there instead"
+            )
+        if owner not in module.requires:
+            raise RegistrationError(
+                f"{name} extends {document}, but {module.name} does not require {owner.name}"
+            )
+        if clashing := reserved(extension):
+            raise RegistrationError(
+                f"{name} declares {', '.join(clashing)}, which every document has already"
+            )
+        for field in added(extension):
+            if field in host.model_fields:
+                raise RegistrationError(f"{name} declares {field!r}, which {document} has already")
+            for other in self._extending.get(host, ()):
+                if field in added(other):
+                    raise RegistrationError(
+                        f"{name} declares {field!r}, which {self._extensions[other]} already "
+                        f"adds to {document}"
+                    )
+        own = {field: extension.model_fields[field] for field in added(extension)}
+        if undefaulted := [f for f, i in own.items() if i.is_required() or i.default_factory]:
+            raise RegistrationError(
+                f"{name} needs a default value for {', '.join(undefaulted)}: documents written "
+                "before it was installed hold nothing for its fields, so read as holding "
+                "their defaults"
+            )
+        personal = [field for field, info in own.items() if holds_personal(info)]
+        if personal and not carries_personal(host):
+            raise RegistrationError(
+                f"{name} holds personal data, but {document} holds none and is erased by no "
+                "one; only a document that is a data subject can be given personal fields"
+            )
+        if kept := [field for field in personal if not is_erased(defaults(extension)[field])]:
+            raise RegistrationError(
+                f"{name}.{kept[0]} holds personal data, so its default must hold none (null, "
+                f"empty or ERASED): erasing a {document} returns the field to its default"
+            )
+        return host
+
+    def _check_moves(self, spec: CommandSpec, transition: str) -> str:
+        """The document a command moves: of those its input refers to, the one kind whose
+        lifecycle has the transition the command declares."""
+        referred = dict.fromkeys(document for _, document in declared(spec.command))
+        having = [
+            name
+            for name in referred
+            if any(t.name == transition for t in self._document_types[name].lifecycle.transitions)
+        ]
+        declaring = f"{spec.name} declares moves = {transition!r}"
+        if len(having) > 1:
+            raise RegistrationError(
+                f"{declaring}, but its input refers to {' and '.join(having)}, each with that "
+                "transition, so which it moves is ambiguous"
+            )
+        if not having:
+            raise RegistrationError(
+                f"{declaring}, but no document its input refers to has that transition; "
+                f"it refers to {', '.join(referred) or 'none'}"
+            )
+        return having[0]
+
+    def _check_amends(self, spec: CommandSpec, by: str) -> None:
+        """A command that amends a document refers to it by one field, returns it or one of
+        its extensions, carries the version it was read at, and otherwise holds only the
+        fields of what it returns, declared the same way, so that whatever the document
+        holds can be sent back."""
+        command = spec.command
+        if by not in command.model_fields:
+            raise RegistrationError(
+                f"{spec.name} declares amends = {by!r}, but {command.__name__} has no such field"
+            )
+        name = refers_to(command, by)
+        if name is None:
+            raise RegistrationError(
+                f"{spec.name} declares amends = {by!r}, but {command.__name__}.{by} does not "
+                "hold a single document's id"
+            )
+        document = self._document_types[name]
+        if spec.result is document:
+            holder, held = name, document.model_fields
+        elif spec.result in self._extending.get(document, ()):
+            extension: type[Extension[Any]] = spec.result
+            holder = self._extensions[extension]
+            held = {field: extension.model_fields[field] for field in added(extension)}
+        else:
+            raise RegistrationError(
+                f"{spec.name} amends {name}, so it must return {document.__name__}, or an "
+                "extension of it"
+            )
+        version = command.model_fields.get("version")
+        if version is None or version.annotation is not int:
+            raise RegistrationError(
+                f"{spec.name} amends {name}, so it needs version: int, the version the document "
+                "was read at, so that a change made from an out-of-date copy is refused"
+            )
+        for field in _amended(command, by):
+            own = held.get(field)
+            if own is None:
+                raise RegistrationError(
+                    f"{spec.name} amends {holder}, which has no field {field!r}; besides "
+                    f"{by} and version, the command holds only {holder}'s own fields"
+                )
+            given = command.model_fields[field]
+            if (given.annotation, given.metadata) != (own.annotation, own.metadata):
+                raise RegistrationError(
+                    f"{spec.name} declares {field} unlike {holder} does; a screen copies the "
+                    "document's value into it, so declare it with the same type and constraints"
+                )
 
     def permissions(self) -> list[str]:
         """Every permission there is to hold, for what is installed: each command by name,
@@ -196,8 +389,13 @@ class Registry:
                 name: {
                     "summary": (kind.__doc__ or "").strip(),
                     "permission": read_permission(name),
-                    "schema": kind.model_json_schema(),
-                    "listing": listing(kind),
+                    "schema": self.extended(kind).model_json_schema(),
+                    "listing": listing(self.extended(kind)),
+                    "part_of": (
+                        {"document": refers_to(kind, kind.part_of), "field": kind.part_of}
+                        if kind.part_of is not None
+                        else None
+                    ),
                     "lifecycle": {
                         "initial": kind.lifecycle.initial,
                         "states": list(kind.lifecycle.states),
@@ -215,12 +413,34 @@ class Registry:
                 }
                 for name, kind in module.documents.items()
             },
+            "extensions": {
+                name: {
+                    "summary": (kind.__doc__ or "").strip(),
+                    "extends": self.document_name(self.host(kind)),
+                    "fields": list(added(kind)),
+                }
+                for name, kind in module.extensions.items()
+            },
             "commands": {
                 name: {
                     "summary": spec.summary,
                     "permission": name,
                     "input": spec.command.model_json_schema(),
                     "returns": spec.returns.json_schema(mode="serialization"),
+                    "moves": (
+                        {"document": self._moved[name], "transition": spec.command.moves}
+                        if name in self._moved
+                        else None
+                    ),
+                    "amends": (
+                        {
+                            "document": refers_to(spec.command, spec.command.amends),
+                            "by": spec.command.amends,
+                            "fields": _amended(spec.command, spec.command.amends),
+                        }
+                        if spec.command.amends is not None
+                        else None
+                    ),
                 }
                 for name, spec in module.commands.items()
             },
@@ -261,9 +481,25 @@ def _check_lifecycle(name: str, document: type[Document]) -> None:
             )
 
 
-def _check_searchable(name: str, document: type[Document]) -> None:
-    for field in document.searchable:
-        info = document.model_fields.get(field)
+def _check_part_of(name: str, document: type[Document], field: str) -> None:
+    if field not in document.model_fields:
+        raise RegistrationError(f"{name} declares part_of = {field!r}, but has no such field")
+    whole = refers_to(document, field)
+    if whole is None:
+        raise RegistrationError(
+            f"{name} declares part_of = {field!r}, but {document.__name__}.{field} does not "
+            "hold a single document's id"
+        )
+    if whole == name:
+        raise RegistrationError(
+            f"{name} declares part_of = {field!r}, which refers to {name} itself; a line is "
+            "part of another kind of document"
+        )
+
+
+def _check_searchable(name: str, declaring: type[Document] | type[Extension[Any]]) -> None:
+    for field in declaring.searchable:
+        info = declaring.model_fields.get(field)
         if info is None:
             raise RegistrationError(f"{name} declares an unknown field {field!r} searchable")
         if not holds_text(info.annotation):
@@ -284,6 +520,11 @@ def _check_unclaimed(name: str, claimed: str | None) -> None:
 def _check_sealable(name: str, model: type[BaseModel]) -> None:
     if reason := unsealable(model):
         raise RegistrationError(f"{name}: {reason}, where it could not be sealed")
+
+
+def _amended(command: type[Command[Any]], by: str) -> list[str]:
+    """The fields a command that amends a document replaces: all but `by` and `version`."""
+    return [field for field in command.model_fields if field not in (by, "version")]
 
 
 def _resolve[K, V](declared: dict[K, V], kind: K, what: str) -> V:

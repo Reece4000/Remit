@@ -34,6 +34,7 @@ class AmendItem(Command[Item]):
     the description.
     """
 
+    amends = "item_id"
     item_id: ItemId
     version: int
     """The version these details were read at. Refused if the item has changed since."""
@@ -42,10 +43,12 @@ class AmendItem(Command[Item]):
 
 
 class DiscontinueItem(Command[Item]):
+    moves = "discontinue"
     item_id: ItemId
 
 
 class ReinstateItem(Command[Item]):
+    moves = "reinstate"
     item_id: ItemId
 
 

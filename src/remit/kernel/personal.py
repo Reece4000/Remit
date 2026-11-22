@@ -39,13 +39,17 @@ def is_personal(info: FieldInfo) -> bool:
     return any(isinstance(meta, _PersonalMark) for meta in info.metadata)
 
 
+def holds_personal(info: FieldInfo) -> bool:
+    """Whether a field can hold personal data: it is marked, or holds a model that can."""
+    return is_personal(info) or any(
+        carries_personal(nested) for nested in _models_in(info.annotation)
+    )
+
+
 @cache
 def carries_personal(model: type[BaseModel]) -> bool:
     """Whether instances of this model can hold personal data, directly or nested."""
-    return any(
-        is_personal(info) or any(carries_personal(nested) for nested in _models_in(info.annotation))
-        for info in model.model_fields.values()
-    )
+    return any(holds_personal(info) for info in model.model_fields.values())
 
 
 def unsealable(model: type[BaseModel]) -> str | None:

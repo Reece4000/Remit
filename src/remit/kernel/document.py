@@ -66,6 +66,14 @@ class Document(BaseModel):
     A search finds the documents whose searchable text holds every word of it, whatever
     the case or accents. See `remit.kernel.search`.
     """
+    part_of: ClassVar[str | None] = None
+    """The field that refers to the document this one is a line of, if it is one:
+    `part_of = "quotation_id"` on a quotation's line.
+
+    A line belongs to its document for good, as an item on an order does, rather than
+    merely mentioning it, as an order mentions its customer. A screen shows lines inside
+    the document they belong to.
+    """
 
     id: UUID = Field(default_factory=uuid7)
     """Identifies the document to the system, for good."""

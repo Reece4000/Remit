@@ -24,7 +24,7 @@ from uuid import UUID
 from .actor import Actor
 from .errors import ConcurrencyError, Rejected, RemitError
 from .module import Module
-from .selection import Json, Selection
+from .selection import Json, Selection, Tally
 
 
 @dataclass(frozen=True)
@@ -95,6 +95,14 @@ class Unit(Protocol):
         """The documents `selection.arranged` would pick from all those stored, in order."""
         ...
 
+    def count(self, selection: Selection) -> int:
+        """How many of the documents stored `selection.matches`, on every page together."""
+        ...
+
+    def tally(self, tally: Tally) -> list[tuple[Any, int]]:
+        """What `tally.counted` would find in all the documents stored."""
+        ...
+
     def events(
         self, *, after: int = 0, name: str | None = None, limit: int | None = None
     ) -> list[StoredEvent]: ...
@@ -112,6 +120,10 @@ class Unit(Protocol):
         self, *, after: int = 0, document: tuple[str, UUID] | None = None, limit: int | None = None
     ) -> list[AuditEntry]:
         """Audit entries after a position, oldest first; only those that wrote `document`."""
+        ...
+
+    def position(self) -> int:
+        """The position of the last audit entry committed, or 0 if there is none."""
         ...
 
     def commit(self, commit: Commit) -> None:
@@ -189,6 +201,14 @@ class MemoryStore:
         stored = (document.body for document in self._documents[selection.kind].values())
         return deepcopy(selection.arranged(stored))
 
+    def count(self, selection: Selection) -> int:
+        stored = self._documents[selection.kind].values()
+        return sum(1 for document in stored if selection.matches(document.body))
+
+    def tally(self, tally: Tally) -> list[tuple[Any, int]]:
+        stored = (document.body for document in self._documents[tally.selection.kind].values())
+        return tally.counted(stored)
+
     def events(
         self, *, after: int = 0, name: str | None = None, limit: int | None = None
     ) -> list[StoredEvent]:
@@ -230,6 +250,9 @@ class MemoryStore:
                 raise ConcurrencyError(f"{document.kind} {document.id} changed since it was read")
         if commit.idempotency and commit.idempotency[:2] in self._idempotency:
             raise ConcurrencyError("the idempotency key was claimed since it was read")
+
+    def position(self) -> int:
+        return len(self._audit)
 
     def commit(self, commit: Commit) -> None:
         self._check(commit)
