@@ -1,0 +1,31 @@
+# Kestrel Animal Health on one machine: Remit's stack running Kestrel's modules, with a
+# realm of Kestrel's own people and agents. From the repository's root:
+#
+#   docker compose -f compose.yaml -f examples/kestrel-animal-health/compose.yaml up --build -d
+#   docker compose -f compose.yaml -f examples/kestrel-animal-health/compose.yaml \
+#       run --rm --entrypoint python api -m kestrel.seed
+#
+# It is a project of its own (`kestrel`), with its own database, on the same ports as
+# Remit's, so stop that one first. People sign in as morgan, priya or tom, each with
+# their name as password; see deploy/kestrel-realm.json. Local use only.
+
+name: kestrel
+
+x-kestrel: &kestrel
+  environment:
+    REMIT_APPLICATION: kestrel:application
+    PYTHONPATH: /examples/kestrel-animal-health
+    REMIT_PROVIDERS: >-
+      [{"issuer": "http://localhost:8080/realms/kestrel", "audience": "remit",
+        "discovery": "http://identity:8080/realms/kestrel/.well-known/openid-configuration"}]
+  volumes:
+    - ./examples/kestrel-animal-health/kestrel:/examples/kestrel-animal-health/kestrel:ro
+
+services:
+  install: *kestrel
+  api: *kestrel
+  worker: *kestrel
+  identity:
+    volumes:
+      # Replaces Remit's realm with Kestrel's: the same container path.
+      - ./examples/kestrel-animal-health/deploy:/opt/keycloak/data/import:ro

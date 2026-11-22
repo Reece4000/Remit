@@ -1,0 +1,135 @@
+{
+  "realm": "kestrel",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "clients": [
+    {
+      "clientId": "remit-desktop",
+      "name": "Remit desktop client",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": [
+        "http://127.0.0.1/*"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "remit",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "kestrel-sourcing",
+      "name": "Kestrel's sourcing agent",
+      "publicClient": false,
+      "secret": "local-sourcing-secret",
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "remit",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "kestrel-export-documents",
+      "name": "Kestrel's export documents agent",
+      "publicClient": false,
+      "secret": "local-export-documents-secret",
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "remit",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "6a0f3c52-8b1e-4d7a-9c25-3e8f71b0d4a1",
+      "username": "morgan",
+      "enabled": true,
+      "email": "morgan@kestrel.example",
+      "emailVerified": true,
+      "firstName": "Morgan",
+      "lastName": "Hale",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "morgan",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "b2d84e19-5c3a-47f0-8e61-0a9c2f7d35b8",
+      "username": "priya",
+      "enabled": true,
+      "email": "priya@kestrel.example",
+      "emailVerified": true,
+      "firstName": "Priya",
+      "lastName": "Shah",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "priya",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "d47a1b60-2e9f-4c83-b5d2-7f1e08a64c39",
+      "username": "tom",
+      "enabled": true,
+      "email": "tom@kestrel.example",
+      "emailVerified": true,
+      "firstName": "Tom",
+      "lastName": "Okafor",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "tom",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "e8c35a07-91d4-4b2f-a6e0-5d7b13c8f924",
+      "username": "service-account-kestrel-sourcing",
+      "enabled": true,
+      "serviceAccountClientId": "kestrel-sourcing"
+    },
+    {
+      "id": "f1b69d24-3a7c-4e05-9d8b-62c0e4a57f13",
+      "username": "service-account-kestrel-export-documents",
+      "enabled": true,
+      "serviceAccountClientId": "kestrel-export-documents"
+    }
+  ]
+}

@@ -42,6 +42,8 @@ packages = ["src/remit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Kestrel's own modules, which tests/test_kestrel.py runs, as a customer's code would be.
+pythonpath = ["examples/kestrel-animal-health"]
 filterwarnings = ["error"]
 
 [tool.ruff]
@@ -73,8 +75,14 @@ show_missing = true
 skip_covered = true
 
 [tool.pyright]
-include = ["src", "tests", "checks"]
-strict = ["src"]
+include = ["src", "tests", "checks", "examples/kestrel-animal-health"]
+strict = ["src", "examples/kestrel-animal-health"]
+# Kestrel's modules are imported as `kestrel`, from its own folder, as its deployment does.
+executionEnvironments = [
+  { root = "examples/kestrel-animal-health" },
+  { root = "tests", extraPaths = ["examples/kestrel-animal-health"] },
+  { root = "." },
+]
 pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"

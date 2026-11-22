@@ -537,10 +537,10 @@ Kernel tests run in memory and on PostgreSQL; ledger tests need PostgreSQL. Runn
 | `src/remit/ledger` | General ledger: accounts, journal entries, reversals, period closes. Built only on the kernel's public API. `books.py` is the bridge to pgledger, `rules.sql` holds what the database enforces, `vendor/pgledger` is pgledger v0.9.0 itself, unmodified. |
 | `src/remit/server` | The REST API, token verification, the worker, and the `remit` command. A client of the kernel, built on public APIs only. |
 | `Dockerfile`, `compose.yaml`, `deploy` | The container image, everything running on one machine, and the local Keycloak's realm. |
-| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands; the API driven with signed tokens. |
+| `tests` | Kernel behaviour against a toy module; ledger examples and property tests; direct attacks on the database and races between commands; the API driven with signed tokens; Kestrel's month. |
 | `checks` | The mutation checks behind `./check --deep`. |
 | `docs` | Design notes: [modules and templates](docs/modules-and-templates.md), [extensions](docs/extensions.md), [personal data](docs/personal-data.md). |
-| `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. |
+| `examples` | Five fictional companies built on Remit, used as learning material and as the test of its generality. One runs: [Kestrel Animal Health](examples/kestrel-animal-health), with its own modules, people and a month to play through. |
 
 Three layering rules are enforced by a test: the kernel imports no module, a module
 imports only `remit.kernel` and the top-level packages of the modules it requires, and
