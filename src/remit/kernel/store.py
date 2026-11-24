@@ -5,6 +5,10 @@ registered names; the kernel does the typing. All work happens in a unit, which 
 serialisable transaction: whatever is read and written inside it behaves as though no
 other unit were running. A store that cannot keep that promise for a unit raises
 `ConcurrencyError`, and the kernel runs the work again from the start.
+
+Events and audit entries are numbered in the order their units commit, and become
+visible in that order: a reader that has seen position 10 will never later find a 9.
+So anything that follows the log or the trail by position misses nothing.
 """
 
 import threading
@@ -12,7 +16,7 @@ from collections import defaultdict
 from collections.abc import Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
@@ -56,6 +60,8 @@ class AuditEntry:
     """Log position of the event that triggered this, when a subscription ran."""
     key: UUID | None = None
     """The data key personal values in `input` are sealed with, if it holds any."""
+    position: int = 0
+    """Where the entry sits in the trail, counting from 1. Zero until it is stored."""
 
 
 @dataclass(frozen=True)
@@ -102,7 +108,12 @@ class Unit(Protocol):
         """A data key's secret, or None once the data it sealed has been erased."""
         ...
 
-    def audit(self) -> list[AuditEntry]: ...
+    def audit(
+        self, *, after: int = 0, document: tuple[str, UUID] | None = None, limit: int | None = None
+    ) -> list[AuditEntry]:
+        """Audit entries after a position, oldest first; only those that wrote `document`."""
+        ...
+
     def commit(self, commit: Commit) -> None:
         """Apply the commit. Refused, changing nothing, if it breaks a rule the store keeps."""
         ...
@@ -120,12 +131,23 @@ class Unit(Protocol):
         ...
 
 
+class Listener(Protocol):
+    def wait(self, timeout: float) -> bool:
+        """Wait until a unit commits. True if one has since the last wait, or since listening
+        began; False if none has by the timeout. It may wake for nothing, never miss one."""
+        ...
+
+
 class Store(Protocol):
     runs_sql: bool
     """Whether units can run a module's own SQL. Modules that ship SQL need this."""
 
     def unit(self, *, read_only: bool = False) -> AbstractContextManager[Unit]:
         """A unit of work. A read-only one refuses every change, including through SQL."""
+        ...
+
+    def listen(self) -> AbstractContextManager[Listener]:
+        """Be told when units commit, so that a feed can wait instead of asking repeatedly."""
         ...
 
     def missing(self, modules: Sequence[Module]) -> tuple[str, ...]:
@@ -151,6 +173,7 @@ class MemoryStore:
         self._secrets: dict[UUID, bytes] = {}
         self._subjects: dict[UUID, set[UUID]] = {}
         self._lock = threading.RLock()
+        self._commits = _Commits()
 
     @contextmanager
     def unit(self, *, read_only: bool = False) -> Generator[Unit]:
@@ -178,8 +201,19 @@ class MemoryStore:
     def idempotency(self, actor: str, key: str) -> Json | None:
         return deepcopy(self._idempotency.get((actor, key)))
 
-    def audit(self) -> list[AuditEntry]:
-        return list(self._audit)
+    def audit(
+        self, *, after: int = 0, document: tuple[str, UUID] | None = None, limit: int | None = None
+    ) -> list[AuditEntry]:
+        found = [
+            entry
+            for entry in self._audit[after:]
+            if document is None or any(written[:2] == document for written in entry.documents)
+        ]
+        return found[:limit]
+
+    @contextmanager
+    def listen(self) -> Generator[Listener]:
+        yield _MemoryListener(self._commits)
 
     def secret(self, key: UUID) -> bytes | None:
         return self._secrets.get(key)
@@ -206,7 +240,7 @@ class MemoryStore:
             self._events.append(
                 StoredEvent(position, name, body, commit.audit.at, commit.audit.actor.id)
             )
-        self._audit.append(commit.audit)
+        self._audit.append(replace(commit.audit, position=len(self._audit) + 1))
         if commit.cursor:
             subscription, position = commit.cursor
             self._cursors[subscription] = position
@@ -219,9 +253,44 @@ class MemoryStore:
         erased = set(commit.erasures)
         for key_id in [k for k, subjects in self._subjects.items() if subjects & erased]:
             del self._secrets[key_id], self._subjects[key_id]
+        self._commits.announce()
 
     def sql(self, query: str, parameters: Sequence[object] = ()) -> list[tuple[Any, ...]]:
         raise RemitError("this needs a PostgreSQL store; the memory store cannot run SQL")
 
     def rollback(self) -> None:
         """Nothing to undo: writes only reach this store through `commit`."""
+
+
+class _Commits:
+    """A count of the commits to a memory store, which listeners wait on."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._count = 0
+
+    def announce(self) -> None:
+        with self._changed:
+            self._count += 1
+            self._changed.notify_all()
+
+    def count(self) -> int:
+        with self._changed:
+            return self._count
+
+    def after(self, seen: int, timeout: float) -> int:
+        """The count, once it has moved on from `seen` or the timeout has passed."""
+        with self._changed:
+            self._changed.wait_for(lambda: self._count != seen, timeout)
+            return self._count
+
+
+class _MemoryListener:
+    def __init__(self, commits: _Commits) -> None:
+        self._commits = commits
+        self._seen = commits.count()
+
+    def wait(self, timeout: float) -> bool:
+        count = self._commits.after(self._seen, timeout)
+        committed, self._seen = count != self._seen, count
+        return committed

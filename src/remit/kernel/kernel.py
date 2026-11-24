@@ -8,10 +8,10 @@ Every unit is a serialisable transaction, so the checks a handler makes still ho
 it commits, whatever else is running. When the store cannot serialise a unit, the kernel
 runs it again; handlers only touch the context, which makes that safe.
 
-Reads (`get`, `page`, `ask`, `events`, `audit`) name the actor who is reading, and are
-refused unless that actor holds the permission to read what is asked for. They run in
-read-only units: nothing can be changed through them, and on PostgreSQL they wait for
-a snapshot that can never conflict, so they are never aborted.
+Reads (`get`, `page`, `ask`, `changes`, `history`, `events`, `audit`) name the actor
+who is reading, and are refused unless that actor holds the permission to read what is
+asked for. They run in read-only units: nothing can be changed through them, and on
+PostgreSQL they wait for a snapshot that can never conflict, so they are never aborted.
 """
 
 import random
@@ -32,17 +32,18 @@ from .document import Document
 from .errors import (
     ConcurrencyError,
     NotFound,
+    Problem,
     RegistrationError,
     Rejected,
     RemitError,
     Unauthorised,
     invalid,
 )
-from .message import Command, Outcome, Query, Recorded
-from .module import CommandSpec, Module, Subscription
+from .message import Change, Changes, Command, Outcome, Query, Recorded
+from .module import CommandSpec, Module, Subscription, read_permission
 from .personal import DataKey, carries_personal, seal, unseal
 from .registry import READ_AUDIT, READ_EVENTS, Registry
-from .selection import DEFAULT_LIMIT, Page
+from .selection import DEFAULT_LIMIT, MAX_LIMIT, Page
 from .store import AuditEntry, Commit, Json, MemoryStore, Store, SubjectKey, Unit
 
 
@@ -211,28 +212,82 @@ class Kernel:
     def settings[S: BaseModel](self, kind: type[S]) -> S:
         return cast(S, self._settings[kind])
 
-    def events(self, *, actor: Actor, after: int = 0) -> list[Recorded]:
-        """The event log, in the order events were committed."""
+    def changes(self, *, actor: Actor, after: int = 0, limit: int = DEFAULT_LIMIT) -> Changes:
+        """What has been written since `after`, in the order it was committed.
+
+        Each change lists only the documents the actor may read, and a change that wrote
+        none of those is left out. No permission is needed to follow the feed itself, so
+        a screen can learn what to refresh without seeing anything it could not read.
+        Looks at up to `limit` units of work at a time.
+        """
+        _limited(limit)
+        return self._read(
+            lambda unit: self._changes(actor, unit.audit(after=after, limit=limit), after)
+        )
+
+    def history[D: Document](
+        self, kind: type[D], id: UUID, *, actor: Actor, after: int = 0, limit: int = DEFAULT_LIMIT
+    ) -> Changes:
+        """The changes that wrote one document, oldest first, for an actor who may read it."""
+        _authorise(actor, self.registry.read_permission(kind))
+        _limited(limit)
+        wrote = (self.registry.document_name(kind), id)
+        return self._read(
+            lambda unit: self._changes(
+                actor, unit.audit(after=after, document=wrote, limit=limit), after
+            )
+        )
+
+    def events(self, *, actor: Actor, after: int = 0, limit: int | None = None) -> list[Recorded]:
+        """The event log after a position, in the order events were committed."""
         _authorise(actor, READ_EVENTS)
-        stored = self._read(lambda unit: unit.events(after=after))
+        stored = self._read(lambda unit: unit.events(after=after, limit=limit))
         return [self._codec.load_event(event) for event in stored]
 
-    def audit(self, *, actor: Actor) -> list[AuditEntry]:
-        """Every command and delivery that committed, oldest first.
+    def audit[D: Document](
+        self,
+        *,
+        actor: Actor,
+        after: int = 0,
+        document: tuple[type[D], UUID] | None = None,
+        limit: int | None = None,
+    ) -> list[AuditEntry]:
+        """The commands and deliveries that committed after a position, oldest first.
 
-        Personal values read as they were given, or as `ERASED` once their subject has
-        been erased.
+        With `document`, only those that wrote it. Personal values read as they were
+        given, or as `ERASED` once their subject has been erased.
         """
         _authorise(actor, READ_AUDIT)
+        wrote = (self.registry.document_name(document[0]), document[1]) if document else None
 
         def read(unit: Unit) -> list[AuditEntry]:
             secret = cache(unit.secret)
             return [
                 replace(entry, input=unseal(entry.input, secret, entry.key))
-                for entry in unit.audit()
+                for entry in unit.audit(after=after, document=wrote, limit=limit)
             ]
 
         return self._read(read)
+
+    def _changes(self, actor: Actor, entries: list[AuditEntry], after: int) -> Changes:
+        @cache
+        def readable(kind: str) -> bool:
+            return actor.may(read_permission(kind))
+
+        changes = (
+            Change(
+                entry.position,
+                entry.at,
+                entry.actor.id,
+                entry.action,
+                tuple(written for written in entry.documents if readable(written[0])),
+            )
+            for entry in entries
+        )
+        return Changes(
+            tuple(change for change in changes if change.documents),
+            entries[-1].position if entries else after,
+        )
 
     def _deliver(self, subscription: Subscription, unit: Unit) -> DeliveryFailure | bool:
         """Deliver the subscription's next event. False when it has none waiting."""
@@ -371,6 +426,12 @@ class Kernel:
             keys=keys,
             erasures=context.erasures,
         )
+
+
+def _limited(limit: int) -> None:
+    if not 1 <= limit <= MAX_LIMIT:
+        said = f"must be between 1 and {MAX_LIMIT}"
+        raise Rejected(f"limit {said}", problems=(Problem(("limit",), said),))
 
 
 def _authorise(actor: Actor, permission: str) -> None:

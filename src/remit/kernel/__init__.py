@@ -12,26 +12,32 @@ from .errors import (
     Rejected,
     RemitError,
     Unauthorised,
+    said,
 )
 from .fields import Code, Country, MultiLine, Name, SingleLine, Text, UnitCode, unit_name
 from .kernel import DeliveryFailure, Dispatched, Kernel
-from .message import Command, Event, Outcome, Query, Recorded
-from .module import Migration, Module
+from .message import Change, Changes, Command, Event, Outcome, Query, Recorded
+from .module import CommandSpec, Migration, Module, QuerySpec
 from .money import Currency, Money, minor_units
 from .personal import ERASED, Personal
 from .postgres import PostgresStore
 from .reference import References
 from .registry import Registry
-from .selection import Page
-from .store import AuditEntry, MemoryStore, Store, Unit
+from .selection import DEFAULT_LIMIT, MAX_LIMIT, Page
+from .store import AuditEntry, Listener, MemoryStore, Store, Unit
 
 __all__ = [
+    "DEFAULT_LIMIT",
     "ERASED",
+    "MAX_LIMIT",
     "Actor",
     "ActorKind",
     "AuditEntry",
+    "Change",
+    "Changes",
     "Code",
     "Command",
+    "CommandSpec",
     "ConcurrencyError",
     "Context",
     "Country",
@@ -43,6 +49,7 @@ __all__ = [
     "Event",
     "Kernel",
     "Lifecycle",
+    "Listener",
     "MemoryStore",
     "Migration",
     "Module",
@@ -56,6 +63,7 @@ __all__ = [
     "PostgresStore",
     "Problem",
     "Query",
+    "QuerySpec",
     "Reader",
     "Recorded",
     "References",
@@ -71,5 +79,6 @@ __all__ = [
     "Unit",
     "UnitCode",
     "minor_units",
+    "said",
     "unit_name",
 ]

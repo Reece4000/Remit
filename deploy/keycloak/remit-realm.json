@@ -1,0 +1,67 @@
+{
+  "realm": "remit",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "clients": [
+    {
+      "clientId": "remit-desktop",
+      "name": "Remit desktop client",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://127.0.0.1/*"],
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "protocolMappers": [
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "remit",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "remit-agent",
+      "name": "A Remit agent",
+      "publicClient": false,
+      "secret": "local-agent-secret",
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "remit",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "0b9f6a3e-2c1d-4f5e-8a7b-1c2d3e4f5a6b",
+      "username": "owner",
+      "enabled": true,
+      "email": "owner@example.com",
+      "emailVerified": true,
+      "firstName": "Local",
+      "lastName": "Owner",
+      "credentials": [{ "type": "password", "value": "owner", "temporary": false }]
+    },
+    {
+      "id": "7d3c2b1a-9e8f-4a6b-b5c4-d3e2f1a0b9c8",
+      "username": "service-account-remit-agent",
+      "enabled": true,
+      "serviceAccountClientId": "remit-agent"
+    }
+  ]
+}
